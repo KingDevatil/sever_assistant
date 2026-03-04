@@ -1,0 +1,16 @@
+{
+  "layout_params": {
+    "category_spacing": 0,
+    "title_button_spacing": -5,
+    "button_spacing": 5,
+    "button_width": 150,
+    "button_height": 30,
+    "category_font_size": 12,
+    "category_line_height": 0.5,
+    "command_panel_height": 400,
+    "output_panel_height": 400,
+    "window_width": 1200,
+    "window_height": 800
+  },
+  "dark_mode": true
+}

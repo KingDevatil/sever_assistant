@@ -1,0 +1,49 @@
+[
+  {
+    "name": "1",
+    "commands": [
+      {
+        "name": "5",
+        "command": "5",
+        "params": []
+      },
+      {
+        "name": "2",
+        "command": "2",
+        "params": []
+      },
+      {
+        "name": "4",
+        "command": "4",
+        "params": []
+      },
+      {
+        "name": "3",
+        "command": "3",
+        "params": []
+      },
+      {
+        "name": "1",
+        "command": "1",
+        "params": [
+          "time"
+        ]
+      },
+      {
+        "name": "6",
+        "command": "6",
+        "params": []
+      }
+    ]
+  },
+  {
+    "name": "时间",
+    "commands": [
+      {
+        "name": "1",
+        "command": "1",
+        "params": []
+      }
+    ]
+  }
+]
