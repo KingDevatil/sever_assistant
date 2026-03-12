@@ -479,6 +479,7 @@ class ServerAssistant(QMainWindow):
         }
         
         self.dark_mode = False  # 默认浅色模式
+        self.last_local_dir = ''  # 上次使用的本地目录
         
         # 输出锁，确保多线程环境下输出顺序正确
         self.output_mutex = QMutex()
@@ -585,7 +586,6 @@ class ServerAssistant(QMainWindow):
         self.save_settings()
     
     def load_settings(self):
-        # 加载保存的设置
         if os.path.exists(self.settings_file):
             try:
                 with open(self.settings_file, 'r', encoding='utf-8') as f:
@@ -594,15 +594,17 @@ class ServerAssistant(QMainWindow):
                         self.layout_params.update(settings['layout_params'])
                     if 'dark_mode' in settings:
                         self.dark_mode = settings['dark_mode']
+                    if 'last_local_dir' in settings:
+                        self.last_local_dir = settings['last_local_dir']
             except Exception as e:
                 print(f"加载设置失败: {e}")
     
     def save_settings(self):
-        # 保存设置到文件
         try:
             settings = {
                 'layout_params': self.layout_params,
-                'dark_mode': self.dark_mode
+                'dark_mode': self.dark_mode,
+                'last_local_dir': self.last_local_dir
             }
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
@@ -1622,11 +1624,14 @@ class ServerAssistant(QMainWindow):
             
             from PyQt5.QtWidgets import QFileDialog
             file_name = os.path.basename(file_path)
+            default_dir = self.last_local_dir if self.last_local_dir and os.path.exists(self.last_local_dir) else os.getcwd()
             local_path, _ = QFileDialog.getSaveFileName(
-                self, "保存文件", os.path.join(os.getcwd(), file_name), "All Files (*)"
+                self, "保存文件", os.path.join(default_dir, file_name), "All Files (*)"
             )
             
             if local_path:
+                self.last_local_dir = os.path.dirname(local_path)
+                self.save_settings()
                 self.append_output(f"保存到: {local_path}<br>")
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 保存到: {local_path}")
                 
@@ -1757,11 +1762,14 @@ class ServerAssistant(QMainWindow):
         
         try:
             from PyQt5.QtWidgets import QFileDialog
+            default_dir = self.last_local_dir if self.last_local_dir and os.path.exists(self.last_local_dir) else os.getcwd()
             local_path, _ = QFileDialog.getOpenFileName(
-                self, "选择要上传的文件", os.getcwd(), "All Files (*)"
+                self, "选择要上传的文件", default_dir, "All Files (*)"
             )
             
             if local_path:
+                self.last_local_dir = os.path.dirname(local_path)
+                self.save_settings()
                 sftp = client.open_sftp()
                 
                 if server_name in self.current_dirs:
