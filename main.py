@@ -4,7 +4,7 @@
 import sys
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy
 from PyQt5.QtCore import QStandardPaths
-from PyQt5.QtCore import Qt, QSettings, QSize, QMimeData, QEvent, QMutex, QMutexLocker
+from PyQt5.QtCore import Qt, QSettings, QSize, QMimeData, QEvent, QMutex, QMutexLocker, QTimer
 from PyQt5.QtGui import QIcon, QFont, QColor, QDrag, QTextCursor
 import paramiko
 import json
@@ -116,10 +116,13 @@ class ServerManager:
                         server['host'],
                         port=server['port'],
                         username=server['username'],
-                        password=server['password']
+                        password=server['password'],
+                        timeout=10,
+                        banner_timeout=20,
+                        auth_timeout=30
                     )
+                    client.get_transport().set_keepalive(30)
                     self.connections[server_name] = client
-                    # 创建持久的shell会话
                     shell = client.invoke_shell()
                     self.shells[server_name] = shell
                     return True
@@ -147,6 +150,23 @@ class ServerManager:
     
     def is_connected(self, server_name):
         return server_name in self.connections
+    
+    def is_connection_alive(self, server_name):
+        if server_name not in self.connections:
+            return False
+        try:
+            transport = self.connections[server_name].get_transport()
+            if transport is None or not transport.is_active():
+                return False
+            return True
+        except:
+            return False
+    
+    def ensure_connection(self, server_name):
+        if not self.is_connection_alive(server_name):
+            self.disconnect_server(server_name)
+            return self.connect_server(server_name)
+        return True
     
     def get_connection(self, server_name):
         return self.connections.get(server_name)
@@ -491,6 +511,10 @@ class ServerAssistant(QMainWindow):
         self.setGeometry(100, 100, self.layout_params['window_width'], self.layout_params['window_height'])
         
         self.init_ui()
+        
+        self.connection_check_timer = QTimer()
+        self.connection_check_timer.timeout.connect(self.check_connections_status)
+        self.connection_check_timer.start(60000)
     
     def append_output(self, text, is_html=True):
         with QMutexLocker(self.output_mutex):
@@ -503,7 +527,35 @@ class ServerAssistant(QMainWindow):
                 self.server_output.insertPlainText(text)
             self.server_output.ensureCursorVisible()
     
-
+    def remove_stop_button(self):
+        if hasattr(self, 'stop_button') and self.stop_button:
+            try:
+                self.stop_button_layout.removeWidget(self.stop_button)
+                self.stop_button.deleteLater()
+            except:
+                pass
+            self.stop_button = None
+    
+    def check_connections_status(self):
+        disconnected_servers = []
+        for server_name in list(self.server_manager.connections.keys()):
+            if not self.server_manager.is_connection_alive(server_name):
+                disconnected_servers.append(server_name)
+                self.server_manager.disconnect_server(server_name)
+        
+        if disconnected_servers:
+            self.remove_stop_button()
+            self.refresh_server_list()
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到以下服务器连接已断开: {', '.join(disconnected_servers)}")
+            for server_name in disconnected_servers:
+                for i in range(self.server_tabs.count()):
+                    if self.server_tabs.tabText(i) == server_name:
+                        self.server_tabs.removeTab(i)
+                        break
+                if server_name in self.server_button_layouts:
+                    del self.server_button_layouts[server_name]
+                if server_name in self.current_dirs:
+                    del self.current_dirs[server_name]
     
     def highlight_keywords(self, text):
         # 关键字高亮功能
@@ -938,17 +990,15 @@ class ServerAssistant(QMainWindow):
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接服务器时发生错误: {e}")
     
     def disconnect_server(self, server_name):
+        self.remove_stop_button()
         self.server_manager.disconnect_server(server_name)
         self.refresh_server_list()
-        # 移除对应的服务器页签
         for i in range(self.server_tabs.count()):
             if self.server_tabs.tabText(i) == server_name:
                 self.server_tabs.removeTab(i)
                 break
-        # 从布局字典中移除
         if server_name in self.server_button_layouts:
             del self.server_button_layouts[server_name]
-        # 从当前目录字典中移除
         if server_name in self.current_dirs:
             del self.current_dirs[server_name]
         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 已断开与服务器的连接: {server_name}")
@@ -1189,11 +1239,20 @@ class ServerAssistant(QMainWindow):
         layout.addWidget(main_container)
     
     def execute_command(self, server_name, command_info):
-        # 记录执行日志
         command = command_info['command']
         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 执行命令: {command}")
         
-        # 始终使用实际服务器连接
+        if not self.server_manager.is_connection_alive(server_name):
+            self.remove_stop_button()
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
+            self.refresh_server_list()
+            if not self.server_manager.ensure_connection(server_name):
+                QMessageBox.warning(self, '连接失败', f'服务器 {server_name} 连接已断开且无法重新连接')
+                self.command_log.append(f"  错误: 无法重新连接到服务器 {server_name}")
+                return
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 重新连接成功")
+            self.refresh_server_list()
+        
         client = self.server_manager.get_connection(server_name)
         if not client:
             QMessageBox.warning(self, '未连接', f'服务器 {server_name} 未连接')
@@ -1519,30 +1578,22 @@ class ServerAssistant(QMainWindow):
                 self.command_log.append(f"  提交命令到线程池: {command}")
                 runnable = CommandRunnable(client, command, self.command_log, server_name, self.server_manager, self.current_dirs)
                 
-                # 保存当前运行的任务，以便可以停止它
                 self.current_runnable = runnable
                 
-                # 检查是否是持续运行的命令
                 is_continuous_command = any(cmd in command for cmd in ['tailf', 'tail -f', 'top', 'watch'])
                 
                 if is_continuous_command:
-                    # 为持续运行的命令添加停止按钮
-                    self.stop_button = QPushButton('停止命令')
+                    self.remove_stop_button()
+                    self.stop_button = QPushButton(f'停止命令 ({server_name})')
                     self.stop_button.clicked.connect(lambda: runnable.stop())
-                    # 将停止按钮添加到输出框下方的布局中
                     self.stop_button_layout.addWidget(self.stop_button)
                 
-                # 连接信号
                 def on_command_result(result):
                     self.command_log.append(f"  收到命令执行结果")
                     highlighted_text = self.highlight_keywords(result)
                     self.append_output(highlighted_text)
                     self.command_log.append("  执行完成")
-                    # 移除停止按钮
-                    if is_continuous_command and hasattr(self, 'stop_button'):
-                        self.stop_button_layout.removeWidget(self.stop_button)
-                        self.stop_button.deleteLater()
-                        delattr(self, 'stop_button')
+                    self.remove_stop_button()
                 
                 def on_partial_result(partial):
                     highlighted_text = self.highlight_keywords(partial)
@@ -1550,14 +1601,9 @@ class ServerAssistant(QMainWindow):
                 
                 def on_finished():
                     self.command_log.append("  命令执行完成")
-                    # 移除停止按钮
-                    if is_continuous_command and hasattr(self, 'stop_button'):
-                        self.stop_button_layout.removeWidget(self.stop_button)
-                        self.stop_button.deleteLater()
-                        delattr(self, 'stop_button')
+                    self.remove_stop_button()
                 
                 def on_current_dir_updated(server_name, current_dir):
-                    # 保存当前目录
                     self.current_dirs[server_name] = current_dir
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 更新当前目录: {current_dir}")
                 
@@ -1599,6 +1645,17 @@ class ServerAssistant(QMainWindow):
                 self.execute_command(server_name, command_info)
     
     def download_file(self, server_name, file_path):
+        if not self.server_manager.is_connection_alive(server_name):
+            self.remove_stop_button()
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
+            self.refresh_server_list()
+            if not self.server_manager.ensure_connection(server_name):
+                self.append_output("无法重新连接服务器<br>")
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 下载文件失败: 无法重新连接服务器")
+                return
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 重新连接成功")
+            self.refresh_server_list()
+        
         client = self.server_manager.get_connection(server_name)
         if not client:
             self.append_output("无法获取服务器连接<br>")
@@ -1755,6 +1812,17 @@ class ServerAssistant(QMainWindow):
             self.download_file(server_name, file_path)
     
     def upload_file(self, server_name):
+        if not self.server_manager.is_connection_alive(server_name):
+            self.remove_stop_button()
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
+            self.refresh_server_list()
+            if not self.server_manager.ensure_connection(server_name):
+                self.append_output("无法重新连接服务器<br>")
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传文件失败: 无法重新连接服务器")
+                return
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 重新连接成功")
+            self.refresh_server_list()
+        
         client = self.server_manager.get_connection(server_name)
         if not client:
             self.append_output("无法获取服务器连接<br>")
@@ -2137,10 +2205,9 @@ class ServerAssistant(QMainWindow):
             self.save_settings()
     
     def on_server_tab_changed(self, index):
-        # 当服务器标签切换时更新输出终端
+        self.remove_stop_button()
         if index >= 0:
             server_name = self.server_tabs.tabText(index)
-            # 清空输出终端
             self.server_output.clear()
             self.server_output.append(f'已切换到服务器: {server_name}')
             
