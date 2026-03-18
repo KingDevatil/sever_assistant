@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 import sys
+import re
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy
-from PyQt5.QtCore import QStandardPaths
-from PyQt5.QtCore import Qt, QSettings, QSize, QMimeData, QEvent, QMutex, QMutexLocker, QTimer
-from PyQt5.QtGui import QIcon, QFont, QColor, QDrag, QTextCursor
+from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont, QColor, QTextCursor
 import paramiko
 import json
 import os
@@ -42,8 +42,58 @@ class DraggableTreeWidget(QTreeWidget):
         event.ignore()
     
     def dropEvent(self, event):
-        # 拒绝所有放置事件
         event.ignore()
+
+class DraggableTextEdit(QTextEdit):
+    files_dropped = pyqtSignal(list)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._drag_active = False
+        self._base_style = ''
+    
+    def setStyleSheet(self, style):
+        if not self._drag_active:
+            self._base_style = style
+        super().setStyleSheet(style)
+    
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._drag_active = True
+            super().setStyleSheet(self._base_style + 'border: 2px solid #1890ff;')
+        else:
+            super().dragEnterEvent(event)
+    
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+    
+    def dragLeaveEvent(self, event):
+        self._drag_active = False
+        self._restore_border()
+        super().dragLeaveEvent(event)
+    
+    def dropEvent(self, event):
+        self._drag_active = False
+        self._restore_border()
+        if event.mimeData().hasUrls():
+            files = []
+            for url in event.mimeData().urls():
+                file_path = url.toLocalFile()
+                if os.path.isfile(file_path):
+                    files.append(file_path)
+            if files:
+                self.files_dropped.emit(files)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+    
+    def _restore_border(self):
+        super().setStyleSheet(self._base_style)
 
 class ServerManager:
     def __init__(self):
@@ -557,67 +607,39 @@ class ServerAssistant(QMainWindow):
                 if server_name in self.current_dirs:
                     del self.current_dirs[server_name]
     
+    # 预编译正则表达式
+    _ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+    _dark_keywords = {
+        'ERROR': '#ff5252', 'error': '#ff5252', 'Error': '#ff5252',
+        'WARN': '#ff9800', 'warn': '#ff9800', 'Warn': '#ff9800',
+        'OK': '#4caf50', 'ok': '#4caf50', 'Ok': '#4caf50',
+        'SUCCESS': '#4caf50', 'success': '#4caf50', 'Success': '#4caf50',
+        'FAILED': '#ff5252', 'failed': '#ff5252', 'Failed': '#ff5252',
+    }
+    _light_keywords = {
+        'ERROR': '#e74c3c', 'error': '#e74c3c', 'Error': '#e74c3c',
+        'WARN': '#f39c12', 'warn': '#f39c12', 'Warn': '#f39c12',
+        'OK': '#27ae60', 'ok': '#27ae60', 'Ok': '#27ae60',
+        'SUCCESS': '#27ae60', 'success': '#27ae60', 'Success': '#27ae60',
+        'FAILED': '#e74c3c', 'failed': '#e74c3c', 'Failed': '#e74c3c',
+    }
+    
     def highlight_keywords(self, text):
-        # 关键字高亮功能
-        # 根据当前模式选择颜色
         if self.dark_mode:
-            # 深色模式下的颜色
-            keywords = {
-                'ERROR': '#ff5252',  # 亮红色
-                'error': '#ff5252',  # 亮红色
-                'Error': '#ff5252',  # 亮红色
-                'WARN': '#ff9800',  # 亮橙色
-                'warn': '#ff9800',  # 亮橙色
-                'Warn': '#ff9800',  # 亮橙色
-                'OK': '#4caf50',  # 亮绿色
-                'ok': '#4caf50',  # 亮绿色
-                'Ok': '#4caf50',  # 亮绿色
-                'SUCCESS': '#4caf50',  # 亮绿色
-                'success': '#4caf50',  # 亮绿色
-                'Success': '#4caf50',  # 亮绿色
-                'FAILED': '#ff5252',  # 亮红色
-                'failed': '#ff5252',  # 亮红色
-                'Failed': '#ff5252',  # 亮红色
-            }
-            ip_color = '#2196f3'  # 亮蓝色
+            keywords = self._dark_keywords
+            ip_color = '#2196f3'
         else:
-            # 浅色模式下的颜色
-            keywords = {
-                'ERROR': '#e74c3c',  # 红色
-                'error': '#e74c3c',  # 红色
-                'Error': '#e74c3c',  # 红色
-                'WARN': '#f39c12',  # 橙色
-                'warn': '#f39c12',  # 橙色
-                'Warn': '#f39c12',  # 橙色
-                'OK': '#27ae60',  # 绿色
-                'ok': '#27ae60',  # 绿色
-                'Ok': '#27ae60',  # 绿色
-                'SUCCESS': '#27ae60',  # 绿色
-                'success': '#27ae60',  # 绿色
-                'Success': '#27ae60',  # 绿色
-                'FAILED': '#e74c3c',  # 红色
-                'failed': '#e74c3c',  # 红色
-                'Failed': '#e74c3c',  # 红色
-            }
-            ip_color = '#3498db'  # 蓝色
+            keywords = self._light_keywords
+            ip_color = '#3498db'
         
-        # 高亮IP地址
-        import re
-        # IP地址正则表达式
-        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
-        # 高亮IP地址
-        replacement = '<span style="color: ' + ip_color + '">\\g<0></span>'
-        text = re.sub(ip_pattern, replacement, text)
+        replacement = f'<span style="color: {ip_color}">\\g<0></span>'
+        text = self._ip_pattern.sub(replacement, text)
         
-        # 高亮关键字
         for keyword, color in keywords.items():
-            # 使用正则表达式进行全词匹配
-            pattern = r'\b' + re.escape(keyword) + r'\b'
-            text = re.sub(pattern, f'<span style="color: {color}">{keyword}</span>', text)
+            pattern = re.compile(r'\b' + re.escape(keyword) + r'\b')
+            text = pattern.sub(f'<span style="color: {color}">{keyword}</span>', text)
         
-        # 确保文本在HTML中能够正确换行
         text = text.replace('\n', '<br>')
-        
         return text
     
     def toggle_dark_mode(self, checked):
@@ -775,15 +797,14 @@ class ServerAssistant(QMainWindow):
         # 输出面板 - 改为TabWidget
         self.output_tabs = QTabWidget()
         
-        # 服务器返回信息页签
-        self.server_output = QTextEdit()
+        # 服务器返回信息页签 - 使用可拖拽的文本编辑器
+        self.server_output = DraggableTextEdit()
         self.server_output.setReadOnly(True)
-        self.server_output.setText('系统就绪，等待连接...')
+        self.server_output.setText('系统就绪，等待连接...\n\n提示：可将文件拖拽到此区域上传到服务器当前目录')
         self.server_output.setStyleSheet('background-color: white; color: black;')
-        # 设置为富文本模式，支持HTML格式
         self.server_output.setAcceptRichText(True)
-        # 启用自动换行
         self.server_output.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.server_output.files_dropped.connect(self.on_files_dropped)
         
         # 指令执行日志页签
         self.command_log = QTextEdit()
@@ -1811,6 +1832,62 @@ class ServerAssistant(QMainWindow):
             # 执行下载
             self.download_file(server_name, file_path)
     
+    def get_current_directory(self, server_name, client):
+        if server_name in self.current_dirs:
+            return self.current_dirs[server_name]
+        
+        shell = self.server_manager.get_shell(server_name)
+        current_dir = "/"
+        
+        if shell:
+            try:
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从shell获取当前目录")
+                shell.send('pwd\n')
+                pwd_output = ""
+                max_attempts = 5
+                attempt = 0
+                while attempt < max_attempts:
+                    time.sleep(0.05)
+                    if shell.recv_ready():
+                        pwd_output += shell.recv(4096).decode('utf-8')
+                        attempt = 0
+                    else:
+                        attempt += 1
+                
+                lines = pwd_output.split('\n')
+                for line in lines:
+                    stripped_line = line.strip()
+                    if stripped_line.startswith('/'):
+                        prompt_chars = ['$', '#', '%', '>', ']']
+                        has_prompt = any(c in stripped_line for c in prompt_chars)
+                        if has_prompt:
+                            min_pos = len(stripped_line)
+                            for c in prompt_chars:
+                                pos = stripped_line.find(c)
+                                if pos != -1 and pos < min_pos:
+                                    min_pos = pos
+                            if min_pos < len(stripped_line):
+                                current_dir = stripped_line[:min_pos].strip()
+                                break
+                        else:
+                            current_dir = stripped_line
+                            break
+                
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 当前目录: {current_dir}")
+            except Exception as e:
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
+                current_dir = "/"
+        else:
+            try:
+                stdin, stdout, stderr = client.exec_command('pwd', timeout=2)
+                current_dir = stdout.read().decode('utf-8').strip()
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从exec_command获取当前目录: {current_dir}")
+            except Exception as e:
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
+                current_dir = "/"
+        
+        return current_dir
+
     def upload_file(self, server_name):
         if not self.server_manager.is_connection_alive(server_name):
             self.remove_stop_button()
@@ -1840,62 +1917,9 @@ class ServerAssistant(QMainWindow):
                 self.save_settings()
                 sftp = client.open_sftp()
                 
-                if server_name in self.current_dirs:
-                    current_dir = self.current_dirs[server_name]
-                    self.append_output(f"当前服务器目录 (保存): {current_dir}<br>")
-                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 使用保存的当前目录: {current_dir}")
-                else:
-                    shell = self.server_manager.get_shell(server_name)
-                    current_dir = "/"
-                    
-                    if shell:
-                        try:
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从shell获取当前目录")
-                            shell.send('pwd\n')
-                            pwd_output = ""
-                            max_attempts = 5
-                            attempt = 0
-                            while attempt < max_attempts:
-                                time.sleep(0.05)
-                                if shell.recv_ready():
-                                    pwd_output += shell.recv(4096).decode('utf-8')
-                                    attempt = 0
-                                else:
-                                    attempt += 1
-                            
-                            lines = pwd_output.split('\n')
-                            for line in lines:
-                                stripped_line = line.strip()
-                                if stripped_line.startswith('/'):
-                                    prompt_chars = ['$', '#', '%', '>', ']']
-                                    has_prompt = any(c in stripped_line for c in prompt_chars)
-                                    if has_prompt:
-                                        min_pos = len(stripped_line)
-                                        for c in prompt_chars:
-                                            pos = stripped_line.find(c)
-                                            if pos != -1 and pos < min_pos:
-                                                min_pos = pos
-                                        if min_pos < len(stripped_line):
-                                            current_dir = stripped_line[:min_pos].strip()
-                                            break
-                                    else:
-                                        current_dir = stripped_line
-                                        break
-                            
-                            self.append_output(f"当前服务器目录 (shell): {current_dir}<br>")
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 当前目录: {current_dir}")
-                        except Exception as e:
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
-                            current_dir = "/"
-                    else:
-                        try:
-                            stdin, stdout, stderr = client.exec_command('pwd', timeout=2)
-                            current_dir = stdout.read().decode('utf-8').strip()
-                            self.append_output(f"当前服务器目录 (exec): {current_dir}<br>")
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从exec_command获取当前目录: {current_dir}")
-                        except Exception as e:
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
-                            current_dir = "/"
+                current_dir = self.get_current_directory(server_name, client)
+                self.append_output(f"当前服务器目录: {current_dir}<br>")
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 使用当前目录: {current_dir}")
                 
                 remote_path = current_dir.rstrip('/') + '/' + os.path.basename(local_path)
                 self.append_output(f"尝试上传到: {remote_path}<br>")
@@ -1934,6 +1958,70 @@ class ServerAssistant(QMainWindow):
             
             if ok and server_name:
                 self.upload_file(server_name)
+    
+    def on_files_dropped(self, files):
+        connected_servers = [server['name'] for server in self.server_manager.servers if self.server_manager.is_connected(server['name'])]
+        
+        if not connected_servers:
+            QMessageBox.warning(self, '未连接服务器', '请先连接至少一个服务器')
+            return
+        
+        current_tab_index = self.server_tabs.currentIndex()
+        if current_tab_index >= 0:
+            server_name = self.server_tabs.tabText(current_tab_index)
+        else:
+            from PyQt5.QtWidgets import QInputDialog
+            server_name, ok = QInputDialog.getItem(self, '选择服务器', '请选择要上传文件的服务器:', connected_servers, 0, False)
+            if not (ok and server_name):
+                return
+        
+        if not self.server_manager.is_connection_alive(server_name):
+            self.remove_stop_button()
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
+            self.refresh_server_list()
+            if not self.server_manager.ensure_connection(server_name):
+                self.append_output("无法重新连接服务器<br>")
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传文件失败: 无法重新连接服务器")
+                return
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 重新连接成功")
+            self.refresh_server_list()
+        
+        client = self.server_manager.get_connection(server_name)
+        if not client:
+            self.append_output("无法获取服务器连接<br>")
+            return
+        
+        current_dir = self.get_current_directory(server_name, client)
+        
+        try:
+            sftp = client.open_sftp()
+            success_count = 0
+            fail_count = 0
+            
+            for local_path in files:
+                file_name = os.path.basename(local_path)
+                remote_path = current_dir.rstrip('/') + '/' + file_name
+                
+                self.append_output(f"正在上传: {file_name} -> {remote_path}<br>")
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 拖拽上传: {local_path} -> {remote_path}")
+                
+                try:
+                    sftp.put(local_path, remote_path)
+                    self.append_output(f"上传成功: {file_name}<br>")
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传成功: {file_name}")
+                    success_count += 1
+                except Exception as e:
+                    self.append_output(f"上传失败: {file_name} - {e}<br>")
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传失败: {file_name} - {e}")
+                    fail_count += 1
+            
+            sftp.close()
+            self.append_output(f"<br>上传完成: 成功 {success_count} 个，失败 {fail_count} 个<br>")
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 批量上传完成: 成功 {success_count}，失败 {fail_count}")
+            
+        except Exception as e:
+            self.append_output(f"上传过程出错: {e}<br>")
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传过程出错: {e}")
     
     def add_category(self):
         category_name, ok = QInputDialog.getText(self, '添加分类', '分类名称:')
