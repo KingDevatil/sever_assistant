@@ -1,11 +1,14 @@
 [
   {
-    "name": "1",
+    "category": "系统操作",
     "commands": [
       {
-        "name": "1",
-        "command": "1",
-        "params": []
+        "name": "查看当前目录",
+        "command": "pwd"
+      },
+      {
+        "name": "列出文件",
+        "command": "ls -la"
       }
     ]
   }
