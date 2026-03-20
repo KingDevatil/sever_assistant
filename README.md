@@ -1,6 +1,8 @@
 # 服务器后台指令快捷输入工具
 
 一个基于PyQt5开发的服务器管理工具，支持多服务器管理、指令管理、文件上传下载等功能。
+<img width="1202" height="832" alt="示意图" src="https://github.com/user-attachments/assets/3cd40f29-f1a6-4016-90bd-20c578ef3af7" />
+
 
 ## 功能特点
 
@@ -81,8 +83,4 @@ pyinstaller --noconfirm "服务器后台指令快捷输入工具.spec"
 - 支持的持续命令：tailf, tail -f, top, watch
 - 执行持续命令时会显示"停止命令"按钮
 
-## 版本历史
 
-- v1.0：初始版本
-- v1.1：修复输出显示问题
-- v1.2：添加深色模式支持

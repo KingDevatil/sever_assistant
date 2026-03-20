@@ -4,7 +4,7 @@
 import sys
 import re
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy
-from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent
 from PyQt5.QtGui import QFont, QColor, QTextCursor
 import paramiko
 import json
@@ -1341,65 +1341,67 @@ class ServerAssistant(QMainWindow):
                         self.signals = CommandSignals()
                         self.is_running = True
                         self.shell = None
-                        # 保存执行前的目录
                         self.saved_dir = current_dirs.get(server_name, "/")
+                        self.command_timeout = 60
                     
                     def stop(self):
                         self.is_running = False
                         if self.shell:
                             try:
-                                # 发送中断信号
-                                self.shell.send('\x03')  # Ctrl+C
+                                self.shell.send('\x03')
                             except:
                                 pass
+                    
+                    def recv_with_timeout(self, timeout=1):
+                        start_time = time.time()
+                        data = ""
+                        while self.is_running and (time.time() - start_time) < timeout:
+                            if self.shell.recv_ready():
+                                try:
+                                    data += self.shell.recv(4096).decode('utf-8')
+                                    if data:
+                                        return data
+                                except Exception:
+                                    break
+                            time.sleep(0.05)
+                        return data
                     
                     def run(self):
                         try:
                             self.command_log.append(f"  线程开始执行命令: {self.command}")
                             
-                            # 检查是否是持续运行的命令
                             is_continuous_command = any(cmd in self.command for cmd in ['tailf', 'tail -f', 'top', 'watch'])
-                            # 检查是否是以.sh结尾的文件，但不将其视为持续运行的命令
-                            # 这样sh脚本会有足够的时间执行完成，同时也会在执行完成后自动停止
                             
-                            # 获取持久的shell会话
                             self.shell = self.server_manager.get_shell(self.server_name)
                             
                             if self.shell:
                                 self.command_log.append(f"  使用持久shell会话执行命令")
                                 
-                                # 暂时不获取执行前目录，避免延迟
                                 current_dir_before = "/"
-                                
-                                # 执行命令
-                                
-                                # 执行命令
                                 self.shell.send(self.command + '\n')
                                 self.command_log.append(f"  命令发送到shell")
                                 
                                 if is_continuous_command:
                                     self.command_log.append(f"  检测到持续运行的命令，开始实时读取输出")
-                                    # 持续读取输出
                                     output_buffer = ""
                                     start_time = time.time()
                                     
-                                    # 发送初始命令信息
                                     self.signals.partial_result.emit(f"$ {self.command}\n")
                                     
-                                    while self.is_running and (time.time() - start_time) < 300:  # 最多运行5分钟
-                                        if self.shell.recv_ready():
-                                            output = self.shell.recv(1024).decode('utf-8')
+                                    while self.is_running and (time.time() - start_time) < 300:
+                                        output = self.recv_with_timeout(0.5)
+                                        if output:
                                             output_buffer += output
-                                            # 当输出包含换行符时，发送部分结果
                                             if '\n' in output_buffer:
                                                 self.signals.partial_result.emit(output_buffer)
                                                 output_buffer = ""
-                                        time.sleep(0.1)  # 避免CPU占用过高
+                                            start_time = time.time()
+                                        elif (time.time() - start_time) > 10:
+                                            break
                                     
                                     if not self.is_running:
                                         self.command_log.append(f"  命令执行被用户停止")
                                         self.signals.partial_result.emit("\n命令已停止\n")
-                                        # 发送 Ctrl+C 终止远程命令
                                         try:
                                             self.shell.send('\x03')
                                             time.sleep(0.1)
@@ -1407,9 +1409,8 @@ class ServerAssistant(QMainWindow):
                                         except Exception as e:
                                             self.command_log.append(f"  发送终止信号失败：{e}")
                                     else:
-                                        self.command_log.append(f"  命令执行超时（5 分钟）")
-                                        self.signals.partial_result.emit("\n命令执行超时\n")
-                                        # 超时后也要发送 Ctrl+C 终止远程命令
+                                        self.command_log.append(f"  命令执行超时（5 分钟）或无输出")
+                                        self.signals.partial_result.emit("\n命令执行超时或无输出\n")
                                         try:
                                             self.shell.send('\x03')
                                             time.sleep(0.1)
@@ -1417,34 +1418,22 @@ class ServerAssistant(QMainWindow):
                                         except Exception as e:
                                             self.command_log.append(f"  发送终止信号失败：{e}")
                                     
-                                    # 持续命令执行后，也获取当前目录
-                                    current_dir = self.saved_dir  # 默认使用保存的目录
+                                    current_dir = self.saved_dir
                                     try:
                                         self.shell.send('pwd\n')
-                                        # 多次尝试读取，确保获取到输出
                                         pwd_output = ""
-                                        max_attempts = 5
-                                        attempt = 0
-                                        while attempt < max_attempts:
-                                            time.sleep(0.05)
+                                        for _ in range(10):
+                                            time.sleep(0.1)
                                             if self.shell.recv_ready():
                                                 pwd_output += self.shell.recv(4096).decode('utf-8')
-                                                attempt = 0
-                                            else:
-                                                attempt += 1
                                         
-                                        # 解析输出，获取目录
                                         lines = pwd_output.split('\n')
-                                        found_dir = None
                                         for line in lines:
                                             stripped_line = line.strip()
-                                            # 只要是/开头就行
                                             if stripped_line.startswith('/'):
-                                                # 检查是否包含提示符，如果包含，截取到提示符之前
                                                 prompt_chars = ['$', '#', '%', '>', ']']
                                                 has_prompt = any(c in stripped_line for c in prompt_chars)
                                                 if has_prompt:
-                                                    # 找到第一个提示符的位置
                                                     min_pos = len(stripped_line)
                                                     for c in prompt_chars:
                                                         pos = stripped_line.find(c)
@@ -1457,7 +1446,6 @@ class ServerAssistant(QMainWindow):
                                                     found_dir = stripped_line
                                                     break
                                         
-                                        # 只有找到有效目录且不是根目录时才使用新目录，否则使用保存的目录
                                         if found_dir and found_dir != "/":
                                             current_dir = found_dir
                                             self.command_log.append(f"  持续命令执行后当前目录: {current_dir}")
@@ -1466,56 +1454,39 @@ class ServerAssistant(QMainWindow):
                                     except Exception as e:
                                         self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
                                     
-                                    # 发送目录更新信号
                                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                                 else:
-                                    # 普通命令，等待执行完成
-                                    # 大幅减少等待时间，快速获取输出
                                     output = ""
-                                    max_attempts = 3
-                                    attempt = 0
+                                    start_time = time.time()
                                     
-                                    while attempt < max_attempts:
-                                        time.sleep(0.05)  # 每次等待0.05秒（比原来减少75%）
-                                        new_output = ""
-                                        while self.shell.recv_ready():
-                                            new_output += self.shell.recv(4096).decode('utf-8')
-                                        if new_output:
-                                            output += new_output
-                                            attempt = 0
-                                        else:
-                                            attempt += 1
+                                    while self.is_running and (time.time() - start_time) < self.command_timeout:
+                                        output_chunk = self.recv_with_timeout(0.3)
+                                        if output_chunk:
+                                            output += output_chunk
+                                            start_time = time.time()
+                                        elif output and (time.time() - start_time) > 1:
+                                            break
+                                        elif not output and (time.time() - start_time) > 3:
+                                            break
                                     
                                     self.command_log.append(f"  读取shell输出完成，长度: {len(output)}")
                                     
-                                    # 快速获取执行后当前目录（用于上传下载功能）
-                                    current_dir = self.saved_dir  # 默认使用保存的目录
+                                    current_dir = self.saved_dir
                                     try:
                                         self.shell.send('pwd\n')
-                                        # 多次尝试读取，确保获取到输出
                                         pwd_output = ""
-                                        max_attempts = 5
-                                        attempt = 0
-                                        while attempt < max_attempts:
-                                            time.sleep(0.05)
+                                        for _ in range(10):
+                                            time.sleep(0.1)
                                             if self.shell.recv_ready():
                                                 pwd_output += self.shell.recv(4096).decode('utf-8')
-                                                attempt = 0
-                                            else:
-                                                attempt += 1
                                         
-                                        # 解析输出，获取目录
                                         lines = pwd_output.split('\n')
-                                        found_dir = None
                                         for line in lines:
                                             stripped_line = line.strip()
-                                            # 只要是/开头就行
                                             if stripped_line.startswith('/'):
-                                                # 检查是否包含提示符，如果包含，截取到提示符之前
                                                 prompt_chars = ['$', '#', '%', '>', ']']
                                                 has_prompt = any(c in stripped_line for c in prompt_chars)
                                                 if has_prompt:
-                                                    # 找到第一个提示符的位置
                                                     min_pos = len(stripped_line)
                                                     for c in prompt_chars:
                                                         pos = stripped_line.find(c)
@@ -1528,7 +1499,6 @@ class ServerAssistant(QMainWindow):
                                                     found_dir = stripped_line
                                                     break
                                         
-                                        # 只有找到有效目录且不是根目录时才使用新目录，否则使用保存的目录
                                         if found_dir and found_dir != "/":
                                             current_dir = found_dir
                                             self.command_log.append(f"  执行后当前目录: {current_dir}")
@@ -1537,54 +1507,41 @@ class ServerAssistant(QMainWindow):
                                     except Exception as e:
                                         self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
                                     
-                                    # 发送目录更新信号
                                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                                     
-                                    # 构建完整的输出，只包括命令和输出结果
                                     full_output = f"$ {self.command}\n{output}"
                                     self.command_log.append(f"  构建完整输出完成")
                                     
-                                    # 发送信号到主线程
                                     self.signals.result.emit(full_output)
                             else:
                                 self.command_log.append(f"  没有持久shell会话，使用普通命令执行")
-                                # 执行命令
-                                stdin, stdout, stderr = self.client.exec_command(self.command, timeout=10)
-                                self.command_log.append(f"  命令执行中...")
-                                
                                 try:
+                                    stdin, stdout, stderr = self.client.exec_command(self.command, timeout=self.command_timeout)
+                                    self.command_log.append(f"  命令执行中...")
+                                    
                                     output = stdout.read().decode('utf-8') + stderr.read().decode('utf-8')
                                     self.command_log.append(f"  命令执行完成，输出长度: {len(output)}")
-                                except paramiko.ssh_exception.SSHException as e:
-                                    if "timed out" in str(e):
-                                        output = "命令执行超时（可能是持续运行的命令，如tailf）"
-                                        self.command_log.append(f"  命令执行超时: {e}")
-                                    else:
-                                        raise
+                                except Exception as e:
+                                    output = f"命令执行出错: {e}"
+                                    self.command_log.append(f"  命令执行出错: {e}")
                                 
-                                # 快速获取新的当前目录（用于上传下载功能）
-                                current_dir = self.saved_dir  # 默认使用保存的目录
+                                current_dir = self.saved_dir
                                 try:
-                                    stdin_pwd, stdout_pwd, stderr_pwd = self.client.exec_command('pwd', timeout=2)
+                                    stdin_pwd, stdout_pwd, stderr_pwd = self.client.exec_command('pwd', timeout=5)
                                     found_dir = stdout_pwd.read().decode('utf-8').strip()
-                                    # 只有找到有效目录且不是根目录时才使用新目录，否则使用保存的目录
                                     if found_dir and found_dir != "/":
                                         current_dir = found_dir
                                         self.command_log.append(f"  当前目录: {current_dir}")
                                     else:
                                         self.command_log.append(f"  使用保存的目录: {current_dir}")
-                                    # 发送目录更新信号
                                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                                 except Exception as e:
                                     self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
-                                    # 发送目录更新信号
                                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                                 
-                                # 构建完整的输出
                                 full_output = f"$ {self.command}\n{output}"
                                 self.command_log.append(f"  构建完整输出完成")
                                 
-                                # 发送信号到主线程
                                 self.signals.result.emit(full_output)
                             
                             self.command_log.append(f"  命令执行完成")
