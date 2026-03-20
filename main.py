@@ -1267,6 +1267,22 @@ class ServerAssistant(QMainWindow):
             self.command_log.append(f"  错误: 服务器 {server_name} 未连接")
             return
         
+        # 检查是否有持续运行的指令
+        if hasattr(self, 'current_runnable') and self.current_runnable and self.current_runnable.is_running:
+            reply = QMessageBox.question(
+                self,
+                '指令正在运行',
+                '当前有指令正在运行中，是否立即停止当前指令并执行新指令？',
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.current_runnable.stop()
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户停止当前指令，准备执行新指令")
+            else:
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户取消执行新指令")
+                return
+        
         params = command_info.get('params', [])
         if params:
             dialog = ParamDialog(command_info['name'], params, parent=self)
@@ -1374,29 +1390,17 @@ class ServerAssistant(QMainWindow):
                                     
                                     self.signals.partial_result.emit(f"$ {self.command}\n")
                                     
-                                    while self.is_running and (time.time() - start_time) < 300:
+                                    while self.is_running:
                                         output = self.recv_with_timeout(0.1)
                                         if output:
                                             output_buffer += output
                                             if '\n' in output_buffer:
                                                 self.signals.partial_result.emit(output_buffer)
                                                 output_buffer = ""
-                                            start_time = time.time()
-                                        elif (time.time() - start_time) > 5:
-                                            break
                                     
                                     if not self.is_running:
                                         self.command_log.append(f"  命令执行被用户停止")
                                         self.signals.partial_result.emit("\n命令已停止\n")
-                                        try:
-                                            self.shell.send('\x03')
-                                            time.sleep(0.1)
-                                            self.command_log.append(f"  已发送 Ctrl+C 终止命令")
-                                        except Exception as e:
-                                            self.command_log.append(f"  发送终止信号失败：{e}")
-                                    else:
-                                        self.command_log.append(f"  命令执行超时（5 分钟）或无输出")
-                                        self.signals.partial_result.emit("\n命令执行超时或无输出\n")
                                         try:
                                             self.shell.send('\x03')
                                             time.sleep(0.1)
