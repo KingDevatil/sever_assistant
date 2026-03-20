@@ -3,21 +3,13 @@
 
 import sys
 import re
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox
 from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent
 from PyQt5.QtGui import QFont, QColor, QTextCursor
 import paramiko
 import json
 import os
 import time
-
-# 自定义事件类
-class CommandResultEvent(QEvent):
-    EventType = QEvent.Type(QEvent.registerEventType())
-    
-    def __init__(self, output):
-        super().__init__(self.EventType)
-        self.output = output
 
 class DraggableTreeWidget(QTreeWidget):
     def __init__(self, parent=None):
@@ -186,13 +178,13 @@ class ServerManager:
             try:
                 self.connections[server_name].close()
                 del self.connections[server_name]
-            except:
+            except Exception:
                 pass
         if server_name in self.shells:
             try:
                 self.shells[server_name].close()
                 del self.shells[server_name]
-            except:
+            except Exception:
                 pass
     
     def get_shell(self, server_name):
@@ -209,7 +201,7 @@ class ServerManager:
             if transport is None or not transport.is_active():
                 return False
             return True
-        except:
+        except Exception:
             return False
     
     def ensure_connection(self, server_name):
@@ -337,8 +329,7 @@ class CommandDialog(QDialog):
     def __init__(self, command_info=None, command_manager=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle('编辑指令' if command_info else '添加指令')
-        self.setGeometry(100, 100, 500, 300)
-        # 确保对话框在父窗口中央弹出
+        self.setGeometry(100, 100, 500, 350)
         if parent:
             self.move(parent.frameGeometry().center() - self.frameGeometry().center())
         
@@ -348,20 +339,20 @@ class CommandDialog(QDialog):
         
         form_layout = QFormLayout()
         
-        # 分类选择
         self.category_combo = QComboBox()
         self.load_categories()
         
         self.name_edit = QLineEdit()
         self.command_edit = QLineEdit()
+        self.continuous_output_checkbox = QCheckBox('持续输出模式（命令会持续返回信息，如 tailf、top 等）')
         
         form_layout.addRow('分类:', self.category_combo)
         form_layout.addRow('指令名称:', self.name_edit)
         form_layout.addRow('指令内容:', self.command_edit)
+        form_layout.addRow('', self.continuous_output_checkbox)
         
         layout.addLayout(form_layout)
         
-        # 参数管理
         param_layout = QVBoxLayout()
         param_label = QLabel('参数管理')
         param_label.setFont(QFont('Arial', 10, QFont.Bold))
@@ -378,7 +369,6 @@ class CommandDialog(QDialog):
         
         layout.addLayout(param_layout)
         
-        # 按钮
         button_box = QHBoxLayout()
         save_button = QPushButton('保存')
         cancel_button = QPushButton('取消')
@@ -395,21 +385,16 @@ class CommandDialog(QDialog):
         if command_info:
             self.name_edit.setText(command_info['name'])
             self.command_edit.setText(command_info['command'])
-            # 加载参数
+            if command_info.get('continuous'):
+                self.continuous_output_checkbox.setChecked(True)
             if 'params' in command_info:
                 params = command_info['params']
-                # 确保params是列表
                 if isinstance(params, list):
                     for param in params:
                         if isinstance(param, dict) and 'name' in param:
-                            # 新格式，包含参数名称和提示
                             self.add_param(param['name'], param.get('hint', ''))
                         elif isinstance(param, str):
-                            # 旧格式，只有参数名称
                             self.add_param(param, '')
-                elif isinstance(params, bool):
-                    # 兼容旧的has_param字段
-                    pass
     
     def load_categories(self):
         # 加载分类列表
@@ -433,7 +418,7 @@ class CommandDialog(QDialog):
         hint_edit.setPlaceholderText('参数提示')
         
         delete_button = QPushButton('删除')
-        delete_button.clicked.connect(lambda: self.delete_param(param_widget))
+        delete_button.clicked.connect(lambda checked, pw=param_widget: self.delete_param(pw))
         
         param_hlayout.addWidget(param_edit)
         param_hlayout.addWidget(hint_edit)
@@ -441,7 +426,8 @@ class CommandDialog(QDialog):
         param_widget.setLayout(param_hlayout)
         
         self.params_layout.addWidget(param_widget)
-        self.params.append((param_edit, hint_edit))
+        # 存储param_widget引用以便删除时匹配
+        self.params.append((param_edit, hint_edit, param_widget))
     
     def delete_param(self, param_widget):
         index = self.params_layout.indexOf(param_widget)
@@ -450,14 +436,14 @@ class CommandDialog(QDialog):
             if widget:
                 widget.deleteLater()
             # 从params列表中移除
-            for i, (param_edit, hint_edit) in enumerate(self.params):
-                if param_edit.parent() == param_widget:
+            for i, (param_edit, hint_edit, pw) in enumerate(self.params):
+                if pw == param_widget:
                     self.params.pop(i)
                     break
     
     def get_command_info(self):
         params = []
-        for param_edit, hint_edit in self.params:
+        for param_edit, hint_edit, _ in self.params:
             param_name = param_edit.text()
             if param_name:
                 params.append({
@@ -467,7 +453,8 @@ class CommandDialog(QDialog):
         return {
             'name': self.name_edit.text(),
             'command': self.command_edit.text(),
-            'params': params
+            'params': params,
+            'continuous': self.continuous_output_checkbox.isChecked()
         }
     
     def get_category(self):
@@ -582,7 +569,7 @@ class ServerAssistant(QMainWindow):
             try:
                 self.stop_button_layout.removeWidget(self.stop_button)
                 self.stop_button.deleteLater()
-            except:
+            except Exception:
                 pass
             self.stop_button = None
     
@@ -1330,7 +1317,7 @@ class ServerAssistant(QMainWindow):
                     current_dir_updated = pyqtSignal(str, str)  # (server_name, current_dir)
                 
                 class CommandRunnable(QRunnable):
-                    def __init__(self, client, command, command_log, server_name, server_manager, current_dirs):
+                    def __init__(self, client, command, command_log, server_name, server_manager, current_dirs, is_continuous=False):
                         super().__init__()
                         self.client = client
                         self.command = command
@@ -1343,16 +1330,17 @@ class ServerAssistant(QMainWindow):
                         self.shell = None
                         self.saved_dir = current_dirs.get(server_name, "/")
                         self.command_timeout = 60
+                        self.is_continuous = is_continuous
                     
                     def stop(self):
                         self.is_running = False
                         if self.shell:
                             try:
                                 self.shell.send('\x03')
-                            except:
+                            except Exception:
                                 pass
                     
-                    def recv_with_timeout(self, timeout=1):
+                    def recv_with_timeout(self, timeout=0.1):
                         start_time = time.time()
                         data = ""
                         while self.is_running and (time.time() - start_time) < timeout:
@@ -1363,14 +1351,12 @@ class ServerAssistant(QMainWindow):
                                         return data
                                 except Exception:
                                     break
-                            time.sleep(0.05)
+                            time.sleep(0.01)
                         return data
                     
                     def run(self):
                         try:
                             self.command_log.append(f"  线程开始执行命令: {self.command}")
-                            
-                            is_continuous_command = any(cmd in self.command for cmd in ['tailf', 'tail -f', 'top', 'watch'])
                             
                             self.shell = self.server_manager.get_shell(self.server_name)
                             
@@ -1381,7 +1367,7 @@ class ServerAssistant(QMainWindow):
                                 self.shell.send(self.command + '\n')
                                 self.command_log.append(f"  命令发送到shell")
                                 
-                                if is_continuous_command:
+                                if self.is_continuous:
                                     self.command_log.append(f"  检测到持续运行的命令，开始实时读取输出")
                                     output_buffer = ""
                                     start_time = time.time()
@@ -1389,14 +1375,14 @@ class ServerAssistant(QMainWindow):
                                     self.signals.partial_result.emit(f"$ {self.command}\n")
                                     
                                     while self.is_running and (time.time() - start_time) < 300:
-                                        output = self.recv_with_timeout(0.5)
+                                        output = self.recv_with_timeout(0.1)
                                         if output:
                                             output_buffer += output
                                             if '\n' in output_buffer:
                                                 self.signals.partial_result.emit(output_buffer)
                                                 output_buffer = ""
                                             start_time = time.time()
-                                        elif (time.time() - start_time) > 10:
+                                        elif (time.time() - start_time) > 5:
                                             break
                                     
                                     if not self.is_running:
@@ -1422,10 +1408,12 @@ class ServerAssistant(QMainWindow):
                                     try:
                                         self.shell.send('pwd\n')
                                         pwd_output = ""
-                                        for _ in range(10):
-                                            time.sleep(0.1)
+                                        for _ in range(20):
+                                            time.sleep(0.05)
                                             if self.shell.recv_ready():
                                                 pwd_output += self.shell.recv(4096).decode('utf-8')
+                                                if '\n' in pwd_output:
+                                                    break
                                         
                                         lines = pwd_output.split('\n')
                                         for line in lines:
@@ -1460,13 +1448,13 @@ class ServerAssistant(QMainWindow):
                                     start_time = time.time()
                                     
                                     while self.is_running and (time.time() - start_time) < self.command_timeout:
-                                        output_chunk = self.recv_with_timeout(0.3)
+                                        output_chunk = self.recv_with_timeout(0.1)
                                         if output_chunk:
                                             output += output_chunk
                                             start_time = time.time()
-                                        elif output and (time.time() - start_time) > 1:
+                                        elif output and (time.time() - start_time) > 0.5:
                                             break
-                                        elif not output and (time.time() - start_time) > 3:
+                                        elif not output and (time.time() - start_time) > 1:
                                             break
                                     
                                     self.command_log.append(f"  读取shell输出完成，长度: {len(output)}")
@@ -1475,10 +1463,12 @@ class ServerAssistant(QMainWindow):
                                     try:
                                         self.shell.send('pwd\n')
                                         pwd_output = ""
-                                        for _ in range(10):
-                                            time.sleep(0.1)
+                                        for _ in range(20):
+                                            time.sleep(0.05)
                                             if self.shell.recv_ready():
                                                 pwd_output += self.shell.recv(4096).decode('utf-8')
+                                                if '\n' in pwd_output:
+                                                    break
                                         
                                         lines = pwd_output.split('\n')
                                         for line in lines:
@@ -1553,14 +1543,14 @@ class ServerAssistant(QMainWindow):
                             self.signals.finished.emit()
                 
                 # 提交任务到线程池
+                is_continuous = command_info.get('continuous', False)
+                
                 self.command_log.append(f"  提交命令到线程池: {command}")
-                runnable = CommandRunnable(client, command, self.command_log, server_name, self.server_manager, self.current_dirs)
+                runnable = CommandRunnable(client, command, self.command_log, server_name, self.server_manager, self.current_dirs, is_continuous)
                 
                 self.current_runnable = runnable
                 
-                is_continuous_command = any(cmd in command for cmd in ['tailf', 'tail -f', 'top', 'watch'])
-                
-                if is_continuous_command:
+                if is_continuous:
                     self.remove_stop_button()
                     self.stop_button = QPushButton(f'停止命令 ({server_name})')
                     self.stop_button.clicked.connect(lambda: runnable.stop())
