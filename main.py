@@ -1278,7 +1278,11 @@ class ServerAssistant(QMainWindow):
             )
             if reply == QMessageBox.Yes:
                 self.current_runnable.stop()
+                self.remove_stop_button()
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户停止当前指令，准备执行新指令")
+                # 等待一小段时间确保旧指令停止
+                import time
+                time.sleep(0.2)
             else:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户取消执行新指令")
                 return
@@ -1557,7 +1561,7 @@ class ServerAssistant(QMainWindow):
                 if is_continuous:
                     self.remove_stop_button()
                     self.stop_button = QPushButton(f'停止命令 ({server_name})')
-                    self.stop_button.clicked.connect(lambda: runnable.stop())
+                    self.stop_button.clicked.connect(lambda checked, r=runnable: r.stop())
                     self.stop_button_layout.addWidget(self.stop_button)
                 
                 def on_command_result(result):
