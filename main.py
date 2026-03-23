@@ -4,12 +4,235 @@
 import sys
 import re
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox
-from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent
+from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject
 from PyQt5.QtGui import QFont, QColor, QTextCursor
 import paramiko
 import json
 import os
 import time
+
+
+class CommandSignals(QObject):
+    result = pyqtSignal(str)
+    partial_result = pyqtSignal(str)
+    finished = pyqtSignal()
+    current_dir_updated = pyqtSignal(str, str)
+
+
+class CommandRunnable(QRunnable):
+    def __init__(self, client, command, command_log, server_name, server_manager, current_dirs, is_continuous=False):
+        super().__init__()
+        self.client = client
+        self.command = command
+        self.command_log = command_log
+        self.server_name = server_name
+        self.server_manager = server_manager
+        self.current_dirs = current_dirs
+        self.signals = CommandSignals()
+        self.is_running = True
+        self.shell = None
+        self.saved_dir = current_dirs.get(server_name, "/")
+        self.command_timeout = 60
+        self.is_continuous = is_continuous
+    
+    def stop(self):
+        self.is_running = False
+        if self.shell:
+            try:
+                self.shell.send('\x03')
+            except Exception:
+                pass
+    
+    def recv_with_timeout(self, timeout=0.1):
+        start_time = time.time()
+        data = ""
+        while self.is_running and (time.time() - start_time) < timeout:
+            if self.shell.recv_ready():
+                try:
+                    data += self.shell.recv(4096).decode('utf-8')
+                    if data:
+                        return data
+                except Exception:
+                    break
+            time.sleep(0.01)
+        return data
+    
+    def run(self):
+        try:
+            self.command_log.append(f"  线程开始执行命令: {self.command}")
+            
+            self.shell = self.server_manager.get_shell(self.server_name)
+            
+            if self.shell:
+                self.command_log.append(f"  使用持久shell会话执行命令")
+                
+                current_dir_before = "/"
+                self.shell.send(self.command + '\n')
+                self.command_log.append(f"  命令发送到shell")
+                
+                if self.is_continuous:
+                    self.command_log.append(f"  检测到持续运行的命令，开始实时读取输出")
+                    output_buffer = ""
+                    start_time = time.time()
+                    
+                    self.signals.partial_result.emit(f"$ {self.command}\n")
+                    
+                    while self.is_running:
+                        output = self.recv_with_timeout(0.1)
+                        if output:
+                            output_buffer += output
+                            if '\n' in output_buffer:
+                                self.signals.partial_result.emit(output_buffer)
+                                output_buffer = ""
+                    
+                    if not self.is_running:
+                        self.command_log.append(f"  命令执行被用户停止")
+                        self.signals.partial_result.emit("\n命令已停止\n")
+                        try:
+                            self.shell.send('\x03')
+                            time.sleep(0.1)
+                            self.command_log.append(f"  已发送 Ctrl+C 终止命令")
+                        except Exception as e:
+                            self.command_log.append(f"  发送终止信号失败：{e}")
+                    
+                    current_dir = self.saved_dir
+                    try:
+                        self.shell.send('pwd\n')
+                        pwd_output = ""
+                        for _ in range(20):
+                            time.sleep(0.05)
+                            if self.shell.recv_ready():
+                                pwd_output += self.shell.recv(4096).decode('utf-8')
+                                if '\n' in pwd_output:
+                                    break
+                        
+                        lines = pwd_output.split('\n')
+                        for line in lines:
+                            stripped_line = line.strip()
+                            if stripped_line.startswith('/'):
+                                prompt_chars = ['$', '#', '%', '>', ']']
+                                has_prompt = any(c in stripped_line for c in prompt_chars)
+                                if has_prompt:
+                                    min_pos = len(stripped_line)
+                                    for c in prompt_chars:
+                                        pos = stripped_line.find(c)
+                                        if pos != -1 and pos < min_pos:
+                                            min_pos = pos
+                                    if min_pos < len(stripped_line):
+                                        found_dir = stripped_line[:min_pos].strip()
+                                        break
+                                else:
+                                    found_dir = stripped_line
+                                    break
+                        
+                        if found_dir and found_dir != "/":
+                            current_dir = found_dir
+                            self.command_log.append(f"  持续命令执行后当前目录: {current_dir}")
+                        else:
+                            self.command_log.append(f"  使用保存的目录: {current_dir}")
+                    except Exception as e:
+                        self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
+                    
+                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
+                else:
+                    output = ""
+                    start_time = time.time()
+                    
+                    while self.is_running and (time.time() - start_time) < self.command_timeout:
+                        output_chunk = self.recv_with_timeout(0.1)
+                        if output_chunk:
+                            output += output_chunk
+                            start_time = time.time()
+                        elif output and (time.time() - start_time) > 0.5:
+                            break
+                        elif not output and (time.time() - start_time) > 1:
+                            break
+                    
+                    self.command_log.append(f"  读取shell输出完成，长度: {len(output)}")
+                    
+                    current_dir = self.saved_dir
+                    try:
+                        self.shell.send('pwd\n')
+                        pwd_output = ""
+                        for _ in range(20):
+                            time.sleep(0.05)
+                            if self.shell.recv_ready():
+                                pwd_output += self.shell.recv(4096).decode('utf-8')
+                                if '\n' in pwd_output:
+                                    break
+                        
+                        lines = pwd_output.split('\n')
+                        for line in lines:
+                            stripped_line = line.strip()
+                            if stripped_line.startswith('/'):
+                                prompt_chars = ['$', '#', '%', '>', ']']
+                                has_prompt = any(c in stripped_line for c in prompt_chars)
+                                if has_prompt:
+                                    min_pos = len(stripped_line)
+                                    for c in prompt_chars:
+                                        pos = stripped_line.find(c)
+                                        if pos != -1 and pos < min_pos:
+                                            min_pos = pos
+                                    if min_pos < len(stripped_line):
+                                        found_dir = stripped_line[:min_pos].strip()
+                                        break
+                                else:
+                                    found_dir = stripped_line
+                                    break
+                        
+                        if found_dir and found_dir != "/":
+                            current_dir = found_dir
+                            self.command_log.append(f"  执行后当前目录: {current_dir}")
+                        else:
+                            self.command_log.append(f"  使用保存的目录: {current_dir}")
+                    except Exception as e:
+                        self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
+                    
+                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
+                    
+                    full_output = f"$ {self.command}\n{output}"
+                    self.command_log.append(f"  构建完整输出完成")
+                    
+                    self.signals.result.emit(full_output)
+            else:
+                self.command_log.append(f"  没有持久shell会话，使用普通命令执行")
+                try:
+                    stdin, stdout, stderr = self.client.exec_command(self.command, timeout=self.command_timeout)
+                    self.command_log.append(f"  命令执行中...")
+                    
+                    output = stdout.read().decode('utf-8') + stderr.read().decode('utf-8')
+                    self.command_log.append(f"  命令执行完成，输出长度: {len(output)}")
+                except Exception as e:
+                    output = f"命令执行出错: {e}"
+                    self.command_log.append(f"  命令执行出错: {e}")
+                
+                current_dir = self.saved_dir
+                try:
+                    stdin_pwd, stdout_pwd, stderr_pwd = self.client.exec_command('pwd', timeout=5)
+                    found_dir = stdout_pwd.read().decode('utf-8').strip()
+                    if found_dir and found_dir != "/":
+                        current_dir = found_dir
+                        self.command_log.append(f"  当前目录: {current_dir}")
+                    else:
+                        self.command_log.append(f"  使用保存的目录: {current_dir}")
+                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
+                except Exception as e:
+                    self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
+                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
+                
+                full_output = f"$ {self.command}\n{output}"
+                self.command_log.append(f"  构建完整输出完成")
+                
+                self.signals.result.emit(full_output)
+            
+            self.command_log.append(f"  命令执行完成")
+            self.signals.finished.emit()
+        except Exception as e:
+            error_msg = f"错误: {e}"
+            self.command_log.append(f"  执行命令时出错: {e}")
+            self.signals.result.emit(error_msg)
+            self.signals.finished.emit()
+
 
 class DraggableTreeWidget(QTreeWidget):
     def __init__(self, parent=None):
@@ -1280,13 +1503,17 @@ class ServerAssistant(QMainWindow):
                 self.current_runnable.stop()
                 self.remove_stop_button()
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户停止当前指令，准备执行新指令")
-                # 等待一小段时间确保旧指令停止
-                import time
-                time.sleep(0.2)
+                # 使用QTimer延迟执行新指令，避免阻塞GUI
+                QTimer.singleShot(200, lambda: self._execute_command_continue(command_info, server_name))
+                return
             else:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户取消执行新指令")
                 return
         
+        self._execute_command_continue(command_info, server_name)
+    
+    def _execute_command_continue(self, command_info, server_name):
+        command = command_info['command']
         params = command_info.get('params', [])
         if params:
             dialog = ParamDialog(command_info['name'], params, parent=self)
@@ -1325,230 +1552,6 @@ class ServerAssistant(QMainWindow):
             else:
                 # 执行普通命令
                 self.command_log.append(f"  连接服务器: {server_name}")
-                # 使用线程池执行命令，避免阻塞UI线程
-                from PyQt5.QtCore import QThreadPool, QRunnable
-                
-                from PyQt5.QtCore import pyqtSignal, QObject
-                
-                class CommandSignals(QObject):
-                    result = pyqtSignal(str)
-                    partial_result = pyqtSignal(str)
-                    finished = pyqtSignal()
-                    current_dir_updated = pyqtSignal(str, str)  # (server_name, current_dir)
-                
-                class CommandRunnable(QRunnable):
-                    def __init__(self, client, command, command_log, server_name, server_manager, current_dirs, is_continuous=False):
-                        super().__init__()
-                        self.client = client
-                        self.command = command
-                        self.command_log = command_log
-                        self.server_name = server_name
-                        self.server_manager = server_manager
-                        self.current_dirs = current_dirs
-                        self.signals = CommandSignals()
-                        self.is_running = True
-                        self.shell = None
-                        self.saved_dir = current_dirs.get(server_name, "/")
-                        self.command_timeout = 60
-                        self.is_continuous = is_continuous
-                    
-                    def stop(self):
-                        self.is_running = False
-                        if self.shell:
-                            try:
-                                self.shell.send('\x03')
-                            except Exception:
-                                pass
-                    
-                    def recv_with_timeout(self, timeout=0.1):
-                        start_time = time.time()
-                        data = ""
-                        while self.is_running and (time.time() - start_time) < timeout:
-                            if self.shell.recv_ready():
-                                try:
-                                    data += self.shell.recv(4096).decode('utf-8')
-                                    if data:
-                                        return data
-                                except Exception:
-                                    break
-                            time.sleep(0.01)
-                        return data
-                    
-                    def run(self):
-                        try:
-                            self.command_log.append(f"  线程开始执行命令: {self.command}")
-                            
-                            self.shell = self.server_manager.get_shell(self.server_name)
-                            
-                            if self.shell:
-                                self.command_log.append(f"  使用持久shell会话执行命令")
-                                
-                                current_dir_before = "/"
-                                self.shell.send(self.command + '\n')
-                                self.command_log.append(f"  命令发送到shell")
-                                
-                                if self.is_continuous:
-                                    self.command_log.append(f"  检测到持续运行的命令，开始实时读取输出")
-                                    output_buffer = ""
-                                    start_time = time.time()
-                                    
-                                    self.signals.partial_result.emit(f"$ {self.command}\n")
-                                    
-                                    while self.is_running:
-                                        output = self.recv_with_timeout(0.1)
-                                        if output:
-                                            output_buffer += output
-                                            if '\n' in output_buffer:
-                                                self.signals.partial_result.emit(output_buffer)
-                                                output_buffer = ""
-                                    
-                                    if not self.is_running:
-                                        self.command_log.append(f"  命令执行被用户停止")
-                                        self.signals.partial_result.emit("\n命令已停止\n")
-                                        try:
-                                            self.shell.send('\x03')
-                                            time.sleep(0.1)
-                                            self.command_log.append(f"  已发送 Ctrl+C 终止命令")
-                                        except Exception as e:
-                                            self.command_log.append(f"  发送终止信号失败：{e}")
-                                    
-                                    current_dir = self.saved_dir
-                                    try:
-                                        self.shell.send('pwd\n')
-                                        pwd_output = ""
-                                        for _ in range(20):
-                                            time.sleep(0.05)
-                                            if self.shell.recv_ready():
-                                                pwd_output += self.shell.recv(4096).decode('utf-8')
-                                                if '\n' in pwd_output:
-                                                    break
-                                        
-                                        lines = pwd_output.split('\n')
-                                        for line in lines:
-                                            stripped_line = line.strip()
-                                            if stripped_line.startswith('/'):
-                                                prompt_chars = ['$', '#', '%', '>', ']']
-                                                has_prompt = any(c in stripped_line for c in prompt_chars)
-                                                if has_prompt:
-                                                    min_pos = len(stripped_line)
-                                                    for c in prompt_chars:
-                                                        pos = stripped_line.find(c)
-                                                        if pos != -1 and pos < min_pos:
-                                                            min_pos = pos
-                                                    if min_pos < len(stripped_line):
-                                                        found_dir = stripped_line[:min_pos].strip()
-                                                        break
-                                                else:
-                                                    found_dir = stripped_line
-                                                    break
-                                        
-                                        if found_dir and found_dir != "/":
-                                            current_dir = found_dir
-                                            self.command_log.append(f"  持续命令执行后当前目录: {current_dir}")
-                                        else:
-                                            self.command_log.append(f"  使用保存的目录: {current_dir}")
-                                    except Exception as e:
-                                        self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
-                                    
-                                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
-                                else:
-                                    output = ""
-                                    start_time = time.time()
-                                    
-                                    while self.is_running and (time.time() - start_time) < self.command_timeout:
-                                        output_chunk = self.recv_with_timeout(0.1)
-                                        if output_chunk:
-                                            output += output_chunk
-                                            start_time = time.time()
-                                        elif output and (time.time() - start_time) > 0.5:
-                                            break
-                                        elif not output and (time.time() - start_time) > 1:
-                                            break
-                                    
-                                    self.command_log.append(f"  读取shell输出完成，长度: {len(output)}")
-                                    
-                                    current_dir = self.saved_dir
-                                    try:
-                                        self.shell.send('pwd\n')
-                                        pwd_output = ""
-                                        for _ in range(20):
-                                            time.sleep(0.05)
-                                            if self.shell.recv_ready():
-                                                pwd_output += self.shell.recv(4096).decode('utf-8')
-                                                if '\n' in pwd_output:
-                                                    break
-                                        
-                                        lines = pwd_output.split('\n')
-                                        for line in lines:
-                                            stripped_line = line.strip()
-                                            if stripped_line.startswith('/'):
-                                                prompt_chars = ['$', '#', '%', '>', ']']
-                                                has_prompt = any(c in stripped_line for c in prompt_chars)
-                                                if has_prompt:
-                                                    min_pos = len(stripped_line)
-                                                    for c in prompt_chars:
-                                                        pos = stripped_line.find(c)
-                                                        if pos != -1 and pos < min_pos:
-                                                            min_pos = pos
-                                                    if min_pos < len(stripped_line):
-                                                        found_dir = stripped_line[:min_pos].strip()
-                                                        break
-                                                else:
-                                                    found_dir = stripped_line
-                                                    break
-                                        
-                                        if found_dir and found_dir != "/":
-                                            current_dir = found_dir
-                                            self.command_log.append(f"  执行后当前目录: {current_dir}")
-                                        else:
-                                            self.command_log.append(f"  使用保存的目录: {current_dir}")
-                                    except Exception as e:
-                                        self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
-                                    
-                                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
-                                    
-                                    full_output = f"$ {self.command}\n{output}"
-                                    self.command_log.append(f"  构建完整输出完成")
-                                    
-                                    self.signals.result.emit(full_output)
-                            else:
-                                self.command_log.append(f"  没有持久shell会话，使用普通命令执行")
-                                try:
-                                    stdin, stdout, stderr = self.client.exec_command(self.command, timeout=self.command_timeout)
-                                    self.command_log.append(f"  命令执行中...")
-                                    
-                                    output = stdout.read().decode('utf-8') + stderr.read().decode('utf-8')
-                                    self.command_log.append(f"  命令执行完成，输出长度: {len(output)}")
-                                except Exception as e:
-                                    output = f"命令执行出错: {e}"
-                                    self.command_log.append(f"  命令执行出错: {e}")
-                                
-                                current_dir = self.saved_dir
-                                try:
-                                    stdin_pwd, stdout_pwd, stderr_pwd = self.client.exec_command('pwd', timeout=5)
-                                    found_dir = stdout_pwd.read().decode('utf-8').strip()
-                                    if found_dir and found_dir != "/":
-                                        current_dir = found_dir
-                                        self.command_log.append(f"  当前目录: {current_dir}")
-                                    else:
-                                        self.command_log.append(f"  使用保存的目录: {current_dir}")
-                                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
-                                except Exception as e:
-                                    self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
-                                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
-                                
-                                full_output = f"$ {self.command}\n{output}"
-                                self.command_log.append(f"  构建完整输出完成")
-                                
-                                self.signals.result.emit(full_output)
-                            
-                            self.command_log.append(f"  命令执行完成")
-                            self.signals.finished.emit()
-                        except Exception as e:
-                            error_msg = f"错误: {e}"
-                            self.command_log.append(f"  执行命令时出错: {e}")
-                            self.signals.result.emit(error_msg)
-                            self.signals.finished.emit()
                 
                 # 提交任务到线程池
                 is_continuous = command_info.get('continuous', False)
