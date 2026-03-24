@@ -1490,8 +1490,9 @@ class ServerAssistant(QMainWindow):
             self.command_log.append(f"  错误: 服务器 {server_name} 未连接")
             return
         
-        # 检查是否有持续运行的指令
-        if hasattr(self, 'current_runnable') and self.current_runnable and self.current_runnable.is_running:
+        # 检查是否有持续运行的指令（只对持续输出指令弹窗）
+        is_current_continuous = hasattr(self, 'current_runnable') and self.current_runnable and self.current_runnable.is_running and getattr(self.current_runnable, 'is_continuous', False)
+        if is_current_continuous:
             reply = QMessageBox.question(
                 self,
                 '指令正在运行',
@@ -1513,6 +1514,12 @@ class ServerAssistant(QMainWindow):
         self._execute_command_continue(command_info, server_name)
     
     def _execute_command_continue(self, command_info, server_name):
+        client = self.server_manager.get_connection(server_name)
+        if not client:
+            QMessageBox.warning(self, '未连接', f'服务器 {server_name} 未连接')
+            self.command_log.append(f"  错误: 服务器 {server_name} 未连接")
+            return
+        
         command = command_info['command']
         params = command_info.get('params', [])
         if params:
