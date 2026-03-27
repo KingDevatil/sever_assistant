@@ -4,18 +4,21 @@
     "commands": [
       {
         "name": "5",
-        "command": "5",
-        "params": []
+        "command": "444",
+        "params": [],
+        "continuous": false
       },
       {
         "name": "2",
-        "command": "2",
-        "params": []
+        "command": "23334",
+        "params": [],
+        "continuous": false
       },
       {
         "name": "4",
-        "command": "4",
-        "params": []
+        "command": "4222",
+        "params": [],
+        "continuous": false
       },
       {
         "name": "3",

@@ -3,8 +3,8 @@
 
 import sys
 import re
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox
-from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter
+from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject, QStringListModel
 from PyQt5.QtGui import QFont, QColor, QTextCursor
 import paramiko
 import json
@@ -796,6 +796,16 @@ class ServerAssistant(QMainWindow):
                 pass
             self.stop_button = None
     
+    def eventFilter(self, obj, event):
+        if obj == self.command_input and event.type() == event.KeyPress:
+            if event.key() == Qt.Key_Tab:
+                # 触发自动补全
+                completer = self.command_input.completer()
+                if completer:
+                    completer.complete()
+                return True
+        return super().eventFilter(obj, event)
+    
     def check_connections_status(self):
         disconnected_servers = []
         for server_name in list(self.server_manager.connections.keys()):
@@ -966,7 +976,12 @@ class ServerAssistant(QMainWindow):
         # 设置固定高度为25
         self.server_tabs.setFixedHeight(25)
         
-        # 指令按钮面板（默认显示，不需要连接服务器）
+        # 指令按钮面板（默认显示，不需要连接服务器）- 使用滚动区域
+        self.command_scroll_area = QScrollArea()
+        self.command_scroll_area.setWidgetResizable(True)
+        self.command_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.command_scroll_area.setMinimumHeight(100)
+        
         self.default_command_panel = QWidget()
         self.default_command_layout = QVBoxLayout()
         # 设置顶对齐
@@ -1001,6 +1016,8 @@ class ServerAssistant(QMainWindow):
             }
         ''')
         
+        self.command_scroll_area.setWidget(self.default_command_panel)
+        
         # 刷新默认指令按钮
         self.refresh_default_command_buttons()
         
@@ -1026,10 +1043,51 @@ class ServerAssistant(QMainWindow):
         self.output_tabs.addTab(self.server_output, '服务器返回')
         self.output_tabs.addTab(self.command_log, '执行日志')
         
+        # 命令输入框
+        self.command_input = QLineEdit()
+        self.command_input.setPlaceholderText('输入命令后按回车执行 (Tab键自动补全)')
+        self.command_input.setStyleSheet('''
+            QLineEdit {
+                padding: 8px;
+                border: 1px solid #d9d9d9;
+                border-radius: 4px;
+                font-size: 13px;
+            }
+            QLineEdit:focus {
+                border-color: #1890ff;
+            }
+        ''')
+        self.command_input.returnPressed.connect(self.on_command_input_return)
+        
+        # 禁用Tab键切换焦点，用于自动补全
+        self.command_input.setFocusPolicy(Qt.StrongFocus)
+        
+        # 设置自动补全
+        self.setup_command_completer()
+        
+        # 安装事件过滤器来处理Tab键
+        self.command_input.installEventFilter(self)
+        
+        # 命令输入框容器
+        command_input_widget = QWidget()
+        command_input_layout = QVBoxLayout(command_input_widget)
+        command_input_layout.setContentsMargins(5, 5, 5, 5)
+        command_input_label = QLabel('命令输入:')
+        command_input_label.setStyleSheet('font-weight: bold; color: #333333;')
+        command_input_layout.addWidget(command_input_label)
+        command_input_layout.addWidget(self.command_input)
+        command_input_widget.setMinimumHeight(70)
+        
+        # 使用QSplitter分割输出面板和命令输入框
+        bottom_splitter = QSplitter(Qt.Vertical)
+        bottom_splitter.addWidget(self.output_tabs)
+        bottom_splitter.addWidget(command_input_widget)
+        bottom_splitter.setSizes([self.layout_params['output_panel_height'] - 60, 60])
+        
         # 使用QSplitter分割指令面板和输出面板
         right_splitter = QSplitter(Qt.Vertical)
-        right_splitter.addWidget(self.default_command_panel)
-        right_splitter.addWidget(self.output_tabs)
+        right_splitter.addWidget(self.command_scroll_area)
+        right_splitter.addWidget(bottom_splitter)
         # 设置默认大小比例
         right_splitter.setSizes([self.layout_params['command_panel_height'], self.layout_params['output_panel_height']])
         
@@ -1345,6 +1403,9 @@ class ServerAssistant(QMainWindow):
         
         tab_layout.addWidget(command_buttons_widget)
         self.server_tabs.addTab(tab_widget, server_name)
+        
+        # 连接服务器后更新文件补全
+        self.update_command_completer_with_files()
     
     def refresh_command_buttons(self, server_name):
         # 获取对应服务器的布局
@@ -1373,6 +1434,122 @@ class ServerAssistant(QMainWindow):
         
         # 添加指令按钮
         self.add_command_buttons_to_layout(layout, server_name)
+    
+    def on_command_input_return(self):
+        command = self.command_input.text().strip()
+        if not command:
+            return
+        
+        # 获取当前选中的服务器（从server_tabs获取）
+        server_name = None
+        if self.server_tabs.count() > 0:
+            server_name = self.server_tabs.tabText(self.server_tabs.currentIndex())
+        
+        if not server_name:
+            # 尝试从左侧服务器列表获取选中的服务器
+            selected_items = self.server_list.selectedItems()
+            if selected_items:
+                server_name = selected_items[0].text(0)
+        
+        if not server_name:
+            QMessageBox.warning(self, '未选择服务器', '请先连接或选择一个服务器')
+            return
+        
+        # 检查服务器是否已连接
+        if not self.server_manager.is_connected(server_name):
+            QMessageBox.warning(self, '未连接', f'服务器 {server_name} 未连接')
+            return
+        
+        # 清空输入框
+        self.command_input.clear()
+        
+        # 构造命令信息
+        command_info = {
+            'name': command,
+            'command': command,
+            'params': [],
+            'continuous': False
+        }
+        
+        # 执行命令
+        self._execute_command_continue(command_info, server_name)
+    
+    def setup_command_completer(self):
+        # 常用 Linux 命令
+        common_commands = [
+            'ls', 'ls -la', 'ls -l', 'cd', 'pwd', 'mkdir', 'rm', 'rm -rf',
+            'cp', 'mv', 'cat', 'tail', 'tail -f', 'tailf', 'head',
+            'grep', 'find', 'chmod', 'chown', 'ps', 'ps aux', 'top',
+            'kill', 'kill -9', 'df', 'df -h', 'du', 'du -sh',
+            'tar', 'tar -czvf', 'tar -xzvf', 'zip', 'unzip',
+            'wget', 'curl', 'ping', 'netstat', 'netstat -tlnp',
+            'ifconfig', 'ip addr', 'systemctl', 'systemctl status',
+            'journalctl', 'journalctl -f', 'docker', 'docker ps',
+            'docker logs', 'docker exec', 'kubectl', 'kubectl get',
+            'kubectl logs', 'kubectl exec', 'vim', 'nano', 'less',
+            'more', 'echo', 'touch', 'ln', 'scp', 'rsync',
+            'apt-get', 'apt-get update', 'apt-get install', 'apt-get upgrade',
+            'yum', 'yum install', 'yum update', 'yum upgrade',
+            'service', 'chkconfig', 'crontab', 'at', 'nohup',
+            'screen', 'tmux', 'htop', 'iotop', 'nethogs', 'strace',
+            'lsof', 'ss', 'nc', 'telnet', 'ssh', 'sftp', 'ftp',
+            'mysql', 'psql', 'redis-cli', 'mongo', 'nginx', 'apache2'
+        ]
+        
+        # 创建自动补全器
+        completer = QCompleter(common_commands)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        self.command_input.setCompleter(completer)
+        self.command_completer = completer
+        self.command_completer_model = common_commands
+    
+    def update_command_completer_with_files(self):
+        """获取当前服务器的文件列表并更新补全器"""
+        # 获取当前选中的服务器
+        server_name = None
+        if self.server_tabs.count() > 0:
+            server_name = self.server_tabs.tabText(self.server_tabs.currentIndex())
+        
+        if not server_name or not self.server_manager.is_connected(server_name):
+            return
+        
+        # 获取当前目录
+        current_dir = self.current_dirs.get(server_name, "/")
+        
+        # 执行 ls 命令获取文件列表
+        client = self.server_manager.get_connection(server_name)
+        if not client:
+            return
+        
+        try:
+            stdin, stdout, stderr = client.exec_command(f'ls -la "{current_dir}"', timeout=5)
+            output = stdout.read().decode('utf-8')
+            
+            # 解析文件列表
+            files = []
+            for line in output.split('\n')[1:]:  # 跳过第一行（total）
+                if not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) >= 8:
+                    filename = parts[-1]
+                    # 排除 . 和 ..
+                    if filename not in ['.', '..']:
+                        # 如果是目录，添加 /
+                        if parts[0].startswith('d'):
+                            filename += '/'
+                        files.append(filename)
+            
+            # 更新补全器
+            if files:
+                all_commands = list(set(self.command_completer_model + files))
+                all_commands.sort()
+                self.command_completer.setModel(None)
+                self.command_completerModel = QStringListModel(all_commands)
+                self.command_completer.setModel(self.command_completerModel)
+        except Exception:
+            pass
     
     def refresh_default_command_buttons(self):
         # 清空现有按钮
@@ -1592,6 +1769,8 @@ class ServerAssistant(QMainWindow):
                 def on_current_dir_updated(server_name, current_dir):
                     self.current_dirs[server_name] = current_dir
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 更新当前目录: {current_dir}")
+                    # 更新文件补全
+                    self.update_command_completer_with_files()
                 
                 runnable.signals.result.connect(on_command_result)
                 runnable.signals.partial_result.connect(on_partial_result)
@@ -2263,6 +2442,9 @@ class ServerAssistant(QMainWindow):
             server_name = self.server_tabs.tabText(index)
             self.server_output.clear()
             self.server_output.append(f'已切换到服务器: {server_name}')
+            
+            # 更新文件补全
+            self.update_command_completer_with_files()
             
             # 获取服务器信息
             for server in self.server_manager.servers:
