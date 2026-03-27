@@ -834,16 +834,22 @@ class ServerAssistant(QMainWindow):
                 if client:
                     try:
                         if path_prefix:
-                            search_dir = current_dir
-                            if not search_dir.endswith('/'):
-                                search_dir += '/'
-                            search_path = search_dir + path_prefix
-                            parent_dir = '/'.join(search_path.rstrip('/').split('/')[:-1]) or '/'
-                            if not parent_dir.endswith('/'):
-                                parent_dir += '/'
+                            # 处理相对路径和绝对路径
+                            if path_prefix.startswith('/'):
+                                # 绝对路径
+                                parent_dir = os.path.dirname(path_prefix)
+                                if not parent_dir:
+                                    parent_dir = '/'
+                                search_prefix = os.path.basename(path_prefix)
+                            else:
+                                # 相对路径
+                                parent_dir = current_dir
+                                search_prefix = path_prefix
+                            
                             stdin, stdout, stderr = client.exec_command(f'ls -la "{parent_dir}"', timeout=5)
                         else:
                             stdin, stdout, stderr = client.exec_command(f'ls -la "{current_dir}"', timeout=5)
+                            search_prefix = ''
                         
                         output = stdout.read().decode('utf-8')
                         
@@ -852,16 +858,17 @@ class ServerAssistant(QMainWindow):
                             if not line.strip():
                                 continue
                             parts = line.split()
-                            if len(parts) >= 8:
+                            if len(parts) >= 9:
                                 filename = parts[-1]
                                 if filename not in ['.', '..']:
-                                    if path_prefix:
-                                        if filename.startswith(path_prefix):
-                                            if parts[0].startswith('d'):
+                                    is_dir = parts[0].startswith('d')
+                                    if search_prefix:
+                                        if filename.startswith(search_prefix):
+                                            if is_dir:
                                                 filename += '/'
                                             files.append(filename)
                                     else:
-                                        if parts[0].startswith('d'):
+                                        if is_dir:
                                             filename += '/'
                                         files.append(filename)
                         
@@ -873,8 +880,13 @@ class ServerAssistant(QMainWindow):
                                 model = QStringListModel(files)
                                 completer.setModel(model)
                                 completer.complete()
-                    except Exception:
-                        pass
+                        else:
+                            # 没有匹配的文件，显示提示
+                            self.command_log.append(f"  没有找到匹配 '{search_prefix}' 的目录")
+                    except Exception as e:
+                        self.command_log.append(f"  补全错误: {e}")
+            else:
+                self.command_log.append("  请先连接服务器")
         
         # 默认触发补全
         completer = self.command_input.completer()
