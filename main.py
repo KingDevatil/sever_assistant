@@ -731,6 +731,25 @@ class ParamDialog(QDialog):
     def get_params(self):
         return [edit.text() for edit in self.param_edits]
 
+
+class CommandLineEdit(QLineEdit):
+    """自定义命令输入框，拦截Tab键用于自动补全"""
+    tabPressed = pyqtSignal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Tab:
+            event.accept()
+            self.tabPressed.emit()
+            return
+        super().keyPressEvent(event)
+    
+    def focusNextPrevChild(self, next_child):
+        return False
+
+
 class ServerAssistant(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -796,15 +815,71 @@ class ServerAssistant(QMainWindow):
                 pass
             self.stop_button = None
     
-    def eventFilter(self, obj, event):
-        if obj == self.command_input and event.type() == event.KeyPress:
-            if event.key() == Qt.Key_Tab:
-                # 触发自动补全
-                completer = self.command_input.completer()
-                if completer:
-                    completer.complete()
-                return True
-        return super().eventFilter(obj, event)
+    def on_tab_pressed(self):
+        """处理Tab键按下事件"""
+        current_text = self.command_input.text()
+        
+        # 检查是否是 cd 命令
+        if current_text.startswith('cd '):
+            path_prefix = current_text[3:].strip()
+            
+            server_name = None
+            if self.server_tabs.count() > 0:
+                server_name = self.server_tabs.tabText(self.server_tabs.currentIndex())
+            
+            if server_name and self.server_manager.is_connected(server_name):
+                current_dir = self.current_dirs.get(server_name, "/")
+                client = self.server_manager.get_connection(server_name)
+                
+                if client:
+                    try:
+                        if path_prefix:
+                            search_dir = current_dir
+                            if not search_dir.endswith('/'):
+                                search_dir += '/'
+                            search_path = search_dir + path_prefix
+                            parent_dir = '/'.join(search_path.rstrip('/').split('/')[:-1]) or '/'
+                            if not parent_dir.endswith('/'):
+                                parent_dir += '/'
+                            stdin, stdout, stderr = client.exec_command(f'ls -la "{parent_dir}"', timeout=5)
+                        else:
+                            stdin, stdout, stderr = client.exec_command(f'ls -la "{current_dir}"', timeout=5)
+                        
+                        output = stdout.read().decode('utf-8')
+                        
+                        files = []
+                        for line in output.split('\n')[1:]:
+                            if not line.strip():
+                                continue
+                            parts = line.split()
+                            if len(parts) >= 8:
+                                filename = parts[-1]
+                                if filename not in ['.', '..']:
+                                    if path_prefix:
+                                        if filename.startswith(path_prefix):
+                                            if parts[0].startswith('d'):
+                                                filename += '/'
+                                            files.append(filename)
+                                    else:
+                                        if parts[0].startswith('d'):
+                                            filename += '/'
+                                        files.append(filename)
+                        
+                        if files:
+                            files.sort()
+                            completer = self.command_input.completer()
+                            if completer:
+                                completer.setModel(None)
+                                model = QStringListModel(files)
+                                completer.setModel(model)
+                                completer.complete()
+                    except Exception:
+                        pass
+        
+        # 默认触发补全
+        completer = self.command_input.completer()
+        if completer:
+            completer.complete()
     
     def check_connections_status(self):
         disconnected_servers = []
@@ -1044,7 +1119,7 @@ class ServerAssistant(QMainWindow):
         self.output_tabs.addTab(self.command_log, '执行日志')
         
         # 命令输入框
-        self.command_input = QLineEdit()
+        self.command_input = CommandLineEdit()
         self.command_input.setPlaceholderText('输入命令后按回车执行 (Tab键自动补全)')
         self.command_input.setStyleSheet('''
             QLineEdit {
@@ -1060,13 +1135,13 @@ class ServerAssistant(QMainWindow):
         self.command_input.returnPressed.connect(self.on_command_input_return)
         
         # 禁用Tab键切换焦点，用于自动补全
-        self.command_input.setFocusPolicy(Qt.StrongFocus)
+        self.command_input.setFocusPolicy(Qt.ClickFocus)
         
         # 设置自动补全
         self.setup_command_completer()
         
-        # 安装事件过滤器来处理Tab键
-        self.command_input.installEventFilter(self)
+        # 连接Tab键信号
+        self.command_input.tabPressed.connect(self.on_tab_pressed)
         
         # 命令输入框容器
         command_input_widget = QWidget()
@@ -1080,12 +1155,14 @@ class ServerAssistant(QMainWindow):
         
         # 使用QSplitter分割输出面板和命令输入框
         bottom_splitter = QSplitter(Qt.Vertical)
+        bottom_splitter.setFocusPolicy(Qt.NoFocus)
         bottom_splitter.addWidget(self.output_tabs)
         bottom_splitter.addWidget(command_input_widget)
         bottom_splitter.setSizes([self.layout_params['output_panel_height'] - 60, 60])
         
         # 使用QSplitter分割指令面板和输出面板
         right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setFocusPolicy(Qt.NoFocus)
         right_splitter.addWidget(self.command_scroll_area)
         right_splitter.addWidget(bottom_splitter)
         # 设置默认大小比例
