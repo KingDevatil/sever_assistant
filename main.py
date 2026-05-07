@@ -3,13 +3,247 @@
 
 import sys
 import re
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter, QInputDialog
 from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject, QStringListModel
-from PyQt5.QtGui import QFont, QColor, QTextCursor
+from PyQt5.QtGui import QFont, QColor, QTextCursor, QIntValidator, QPixmap, QPainter
 import paramiko
 import json
 import os
+import posixpath
 import time
+
+
+# ==================== 常量定义 ====================
+
+# 超时时间（秒）
+TIMEOUT_COMMAND = 60          # 命令执行超时
+TIMEOUT_CONNECTION = 10       # 连接超时
+TIMEOUT_BANNER = 20           # SSH banner 超时
+TIMEOUT_AUTH = 30             # 认证超时
+TIMEOUT_EXEC_SHORT = 2        # 短命令执行超时（如 pwd）
+TIMEOUT_EXEC_MEDIUM = 5       # 中等命令执行超时（如 ls）
+TIMEOUT_KEEPALIVE = 30        # 连接保活间隔
+
+# 命令解析相关
+PROMPT_CHARS = ['$', '#', '%', '>', ']']
+RECV_CHUNK_SIZE = 4096        # SSH 接收缓冲区大小
+RECV_POLL_INTERVAL = 0.01     # 轮询间隔（秒）
+RECV_SHELL_DELAY = 0.05       # shell 命令发送后等待时间
+RECV_MAX_ATTEMPTS = 5         # 最大读取尝试次数
+
+# 布局相关
+BUTTONS_PER_ROW = 6           # 每行按钮数量
+
+# 全局样式表
+LIGHT_QSS = '''
+QMainWindow {
+    background-color: #f0f2f5;
+}
+QWidget {
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 13px;
+}
+QTabWidget::pane {
+    border: none;
+    background-color: transparent;
+}
+QTabBar::tab {
+    padding: 5px 14px;
+    margin-right: 2px;
+    background-color: transparent;
+    color: #666;
+    border: none;
+}
+QTabBar::tab:selected {
+    color: #1890ff;
+    border-bottom: 2px solid #1890ff;
+}
+QTabBar::tab:hover:!selected {
+    color: #333;
+}
+QPushButton {
+    background-color: #ffffff;
+    color: #333333;
+    border: 0.5px solid #d9d9d9;
+    border-radius: 6px;
+    padding: 6px 14px;
+}
+QPushButton:hover {
+    background-color: #f0f5ff;
+    border-color: #1890ff;
+    color: #1890ff;
+}
+QPushButton:pressed {
+    background-color: #e6f7ff;
+}
+QLineEdit {
+    padding: 8px 10px;
+    border: 0.5px solid #d9d9d9;
+    border-radius: 6px;
+    background-color: #ffffff;
+}
+QLineEdit:focus {
+    border-color: #1890ff;
+}
+QListWidget {
+    border: 0.5px solid #e8e8e8;
+    border-radius: 8px;
+    background-color: #ffffff;
+    outline: none;
+    padding: 4px;
+}
+QListWidget::item {
+    padding: 6px 8px;
+    border-radius: 4px;
+    margin: 2px 0;
+}
+QListWidget::item:selected {
+    background-color: #e6f7ff;
+    color: #1890ff;
+}
+QListWidget::item:hover:!selected {
+    background-color: #f5f5f5;
+}
+QTreeWidget {
+    border: 0.5px solid #e8e8e8;
+    border-radius: 8px;
+    background-color: #ffffff;
+    outline: none;
+    padding: 4px;
+}
+QTreeWidget::item {
+    padding: 4px 0;
+}
+QTreeWidget::item:selected {
+    background-color: #e6f7ff;
+    color: #1890ff;
+}
+QTreeWidget::item:hover:!selected {
+    background-color: #f5f5f5;
+}
+QScrollBar:vertical {
+    width: 6px;
+    background: transparent;
+}
+QScrollBar::handle:vertical {
+    background: #c0c0c0;
+    border-radius: 3px;
+    min-height: 20px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #a0a0a0;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QScrollBar:horizontal {
+    height: 6px;
+    background: transparent;
+}
+QScrollBar::handle:horizontal {
+    background: #c0c0c0;
+    border-radius: 3px;
+    min-width: 20px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #a0a0a0;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+QSplitter::handle {
+    background-color: #e0e0e0;
+}
+QSplitter::handle:horizontal {
+    width: 2px;
+}
+QSplitter::handle:vertical {
+    height: 2px;
+}
+QWidget#commandPanel {
+    background-color: #ffffff;
+}
+'''
+
+
+# ==================== 工具函数 ====================
+
+def get_base_dir():
+    """获取程序所在目录（支持 PyInstaller 打包）"""
+    if hasattr(sys, '_MEIPASS'):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def clear_layout(layout):
+    """彻底清空布局中的所有控件和子布局"""
+    if layout is None:
+        return
+    while layout.count():
+        item = layout.takeAt(0)
+        if item is None:
+            continue
+        widget = item.widget()
+        if widget is not None:
+            widget.deleteLater()
+        else:
+            sub_layout = item.layout()
+            if sub_layout is not None:
+                clear_layout(sub_layout)
+                sub_layout.deleteLater()
+
+
+def create_status_icon(color_hex, size=10):
+    """创建状态圆点图标"""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor(color_hex))
+    painter.setPen(Qt.NoPen)
+    painter.drawEllipse(0, 0, size, size)
+    painter.end()
+    from PyQt5.QtGui import QIcon
+    return QIcon(pixmap)
+
+
+def parse_pwd_output(pwd_output):
+    """从 pwd 命令输出中解析当前目录路径"""
+    lines = [l.strip() for l in pwd_output.split('\n') if l.strip()]
+
+    def _trim_prompt(s):
+        """从行尾截断连续的提示符字符"""
+        i = len(s) - 1
+        while i >= 0 and s[i].isspace():
+            i -= 1
+        prompt_end = i
+        while i >= 0 and s[i] in PROMPT_CHARS:
+            i -= 1
+        if prompt_end > i and i >= 0:
+            return s[:i + 1].strip()
+        return s
+
+    # 1. 优先找以 / 开头且不包含提示符字符的干净行
+    for line in lines:
+        if line.startswith('/'):
+            if not any(c in line for c in PROMPT_CHARS):
+                return line
+
+    # 2. 找以 / 开头的行，截断行尾连续提示符
+    for line in lines:
+        if line.startswith('/'):
+            trimmed = _trim_prompt(line)
+            return trimmed if trimmed else line
+
+    # 3. 找包含 / 的行（如 [root@host /var/log]# ），提取路径部分
+    for line in lines:
+        if '/' in line:
+            slash_pos = line.find('/')
+            path_part = line[slash_pos:]
+            trimmed = _trim_prompt(path_part)
+            return trimmed if trimmed else path_part
+
+    return "/"
 
 
 class CommandSignals(QObject):
@@ -32,7 +266,7 @@ class CommandRunnable(QRunnable):
         self.is_running = True
         self.shell = None
         self.saved_dir = current_dirs.get(server_name, "/")
-        self.command_timeout = 60
+        self.command_timeout = TIMEOUT_COMMAND
         self.is_continuous = is_continuous
     
     def stop(self):
@@ -49,12 +283,12 @@ class CommandRunnable(QRunnable):
         while self.is_running and (time.time() - start_time) < timeout:
             if self.shell.recv_ready():
                 try:
-                    data += self.shell.recv(4096).decode('utf-8')
+                    data += self.shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
                     if data:
                         return data
                 except Exception:
                     break
-            time.sleep(0.01)
+            time.sleep(RECV_POLL_INTERVAL)
         return data
     
     def run(self):
@@ -100,31 +334,13 @@ class CommandRunnable(QRunnable):
                         self.shell.send('pwd\n')
                         pwd_output = ""
                         for _ in range(20):
-                            time.sleep(0.05)
+                            time.sleep(RECV_SHELL_DELAY)
                             if self.shell.recv_ready():
-                                pwd_output += self.shell.recv(4096).decode('utf-8')
+                                pwd_output += self.shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
                                 if '\n' in pwd_output:
                                     break
-                        
-                        lines = pwd_output.split('\n')
-                        for line in lines:
-                            stripped_line = line.strip()
-                            if stripped_line.startswith('/'):
-                                prompt_chars = ['$', '#', '%', '>', ']']
-                                has_prompt = any(c in stripped_line for c in prompt_chars)
-                                if has_prompt:
-                                    min_pos = len(stripped_line)
-                                    for c in prompt_chars:
-                                        pos = stripped_line.find(c)
-                                        if pos != -1 and pos < min_pos:
-                                            min_pos = pos
-                                    if min_pos < len(stripped_line):
-                                        found_dir = stripped_line[:min_pos].strip()
-                                        break
-                                else:
-                                    found_dir = stripped_line
-                                    break
-                        
+
+                        found_dir = parse_pwd_output(pwd_output)
                         if found_dir and found_dir != "/":
                             current_dir = found_dir
                             self.command_log.append(f"  持续命令执行后当前目录: {current_dir}")
@@ -155,31 +371,13 @@ class CommandRunnable(QRunnable):
                         self.shell.send('pwd\n')
                         pwd_output = ""
                         for _ in range(20):
-                            time.sleep(0.05)
+                            time.sleep(RECV_SHELL_DELAY)
                             if self.shell.recv_ready():
-                                pwd_output += self.shell.recv(4096).decode('utf-8')
+                                pwd_output += self.shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
                                 if '\n' in pwd_output:
                                     break
-                        
-                        lines = pwd_output.split('\n')
-                        for line in lines:
-                            stripped_line = line.strip()
-                            if stripped_line.startswith('/'):
-                                prompt_chars = ['$', '#', '%', '>', ']']
-                                has_prompt = any(c in stripped_line for c in prompt_chars)
-                                if has_prompt:
-                                    min_pos = len(stripped_line)
-                                    for c in prompt_chars:
-                                        pos = stripped_line.find(c)
-                                        if pos != -1 and pos < min_pos:
-                                            min_pos = pos
-                                    if min_pos < len(stripped_line):
-                                        found_dir = stripped_line[:min_pos].strip()
-                                        break
-                                else:
-                                    found_dir = stripped_line
-                                    break
-                        
+
+                        found_dir = parse_pwd_output(pwd_output)
                         if found_dir and found_dir != "/":
                             current_dir = found_dir
                             self.command_log.append(f"  执行后当前目录: {current_dir}")
@@ -200,7 +398,7 @@ class CommandRunnable(QRunnable):
                     stdin, stdout, stderr = self.client.exec_command(self.command, timeout=self.command_timeout)
                     self.command_log.append(f"  命令执行中...")
                     
-                    output = stdout.read().decode('utf-8') + stderr.read().decode('utf-8')
+                    output = stdout.read().decode('utf-8', errors='replace') + stderr.read().decode('utf-8', errors='replace')
                     self.command_log.append(f"  命令执行完成，输出长度: {len(output)}")
                 except Exception as e:
                     output = f"命令执行出错: {e}"
@@ -208,8 +406,8 @@ class CommandRunnable(QRunnable):
                 
                 current_dir = self.saved_dir
                 try:
-                    stdin_pwd, stdout_pwd, stderr_pwd = self.client.exec_command('pwd', timeout=5)
-                    found_dir = stdout_pwd.read().decode('utf-8').strip()
+                    stdin_pwd, stdout_pwd, stderr_pwd = self.client.exec_command('pwd', timeout=TIMEOUT_EXEC_MEDIUM)
+                    found_dir = stdout_pwd.read().decode('utf-8', errors='replace').strip()
                     if found_dir and found_dir != "/":
                         current_dir = found_dir
                         self.command_log.append(f"  当前目录: {current_dir}")
@@ -315,13 +513,7 @@ class ServerManager:
         self.servers = []
         self.connections = {}
         self.shells = {}  # 存储持久的shell会话
-        # 获取程序所在目录（支持PyInstaller打包）
-        if hasattr(sys, '_MEIPASS'):
-            # 当程序被PyInstaller打包时
-            self.base_dir = os.path.dirname(os.path.abspath(sys.executable))
-        else:
-            # 当程序在开发环境中运行时
-            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = get_base_dir()
         self.load_servers()
     
     def load_servers(self):
@@ -382,14 +574,18 @@ class ServerManager:
                         port=server['port'],
                         username=server['username'],
                         password=server['password'],
-                        timeout=10,
-                        banner_timeout=20,
-                        auth_timeout=30
+                        timeout=TIMEOUT_CONNECTION,
+                        banner_timeout=TIMEOUT_BANNER,
+                        auth_timeout=TIMEOUT_AUTH
                     )
-                    client.get_transport().set_keepalive(30)
+                    client.get_transport().set_keepalive(TIMEOUT_KEEPALIVE)
                     self.connections[server_name] = client
-                    shell = client.invoke_shell()
-                    self.shells[server_name] = shell
+                    try:
+                        shell = client.invoke_shell()
+                        self.shells[server_name] = shell
+                    except Exception as shell_error:
+                        # shell 创建失败，保留 exec 连接但记录错误
+                        print(f"创建 shell 会话失败: {shell_error}")
                     return True
                 except Exception as e:
                     print(f"连接失败: {e}")
@@ -439,13 +635,7 @@ class ServerManager:
 class CommandManager:
     def __init__(self):
         self.commands = []
-        # 获取程序所在目录（支持PyInstaller打包）
-        if hasattr(sys, '_MEIPASS'):
-            # 当程序被PyInstaller打包时
-            self.base_dir = os.path.dirname(os.path.abspath(sys.executable))
-        else:
-            # 当程序在开发环境中运行时
-            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = get_base_dir()
         self.load_commands()
     
     def load_commands(self):
@@ -507,6 +697,7 @@ class ServerDialog(QDialog):
         self.name_edit = QLineEdit()
         self.host_edit = QLineEdit()
         self.port_edit = QLineEdit()
+        self.port_edit.setValidator(QIntValidator(1, 65535))
         self.username_edit = QLineEdit()
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
@@ -540,10 +731,14 @@ class ServerDialog(QDialog):
         self.setLayout(layout)
     
     def get_server_info(self):
+        try:
+            port = int(self.port_edit.text())
+        except ValueError:
+            port = 22
         return {
             'name': self.name_edit.text(),
             'host': self.host_edit.text(),
-            'port': int(self.port_edit.text()),
+            'port': port,
             'username': self.username_edit.text(),
             'password': self.password_edit.text()
         }
@@ -777,7 +972,6 @@ class ServerAssistant(QMainWindow):
             'window_height': 800  # 程序窗口默认高度
         }
         
-        self.dark_mode = False  # 默认浅色模式
         self.last_local_dir = ''  # 上次使用的本地目录
         
         # 输出锁，确保多线程环境下输出顺序正确
@@ -834,24 +1028,26 @@ class ServerAssistant(QMainWindow):
                 if client:
                     try:
                         if path_prefix:
-                            # 处理相对路径和绝对路径
+                            # 处理相对路径和绝对路径（远程服务器使用 POSIX 路径语义）
                             if path_prefix.startswith('/'):
                                 # 绝对路径
-                                parent_dir = os.path.dirname(path_prefix)
+                                parent_dir = posixpath.dirname(path_prefix)
                                 if not parent_dir:
                                     parent_dir = '/'
-                                search_prefix = os.path.basename(path_prefix)
+                                search_prefix = posixpath.basename(path_prefix)
                             else:
                                 # 相对路径
                                 parent_dir = current_dir
                                 search_prefix = path_prefix
                             
-                            stdin, stdout, stderr = client.exec_command(f'ls -la "{parent_dir}"', timeout=5)
+                            safe_dir = parent_dir.replace('"', '\\"')
+                            stdin, stdout, stderr = client.exec_command(f'ls -la "{safe_dir}"', timeout=TIMEOUT_EXEC_MEDIUM)
                         else:
-                            stdin, stdout, stderr = client.exec_command(f'ls -la "{current_dir}"', timeout=5)
+                            safe_dir = current_dir.replace('"', '\\"')
+                            stdin, stdout, stderr = client.exec_command(f'ls -la "{safe_dir}"', timeout=TIMEOUT_EXEC_MEDIUM)
                             search_prefix = ''
                         
-                        output = stdout.read().decode('utf-8')
+                        output = stdout.read().decode('utf-8', errors='replace')
                         
                         files = []
                         for line in output.split('\n')[1:]:
@@ -915,7 +1111,7 @@ class ServerAssistant(QMainWindow):
                     del self.current_dirs[server_name]
     
     # 预编译正则表达式
-    _ip_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+    _ip_pattern = re.compile(r'\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b')
     _dark_keywords = {
         'ERROR': '#ff5252', 'error': '#ff5252', 'Error': '#ff5252',
         'WARN': '#ff9800', 'warn': '#ff9800', 'Warn': '#ff9800',
@@ -930,41 +1126,24 @@ class ServerAssistant(QMainWindow):
         'SUCCESS': '#27ae60', 'success': '#27ae60', 'Success': '#27ae60',
         'FAILED': '#e74c3c', 'failed': '#e74c3c', 'Failed': '#e74c3c',
     }
-    
+    # 预编译关键词高亮正则（避免每次调用重复编译）
+    _dark_keyword_patterns = {k: re.compile(r'\b' + re.escape(k) + r'\b') for k in _dark_keywords}
+    _light_keyword_patterns = {k: re.compile(r'\b' + re.escape(k) + r'\b') for k in _light_keywords}
+
     def highlight_keywords(self, text):
-        if self.dark_mode:
-            keywords = self._dark_keywords
-            ip_color = '#2196f3'
-        else:
-            keywords = self._light_keywords
-            ip_color = '#3498db'
-        
+        # 输出面板始终深色，固定使用深色主题配色
+        keywords = self._dark_keywords
+        patterns = self._dark_keyword_patterns
+        ip_color = '#2196f3'
+
         replacement = f'<span style="color: {ip_color}">\\g<0></span>'
         text = self._ip_pattern.sub(replacement, text)
-        
+
         for keyword, color in keywords.items():
-            pattern = re.compile(r'\b' + re.escape(keyword) + r'\b')
-            text = pattern.sub(f'<span style="color: {color}">{keyword}</span>', text)
-        
+            text = patterns[keyword].sub(f'<span style="color: {color}">{keyword}</span>', text)
+
         text = text.replace('\n', '<br>')
         return text
-    
-    def toggle_dark_mode(self, checked):
-        # 切换深色模式
-        self.dark_mode = checked
-        
-        # 只更新输出面板样式
-        if self.dark_mode:
-            # 深色模式样式 - 只应用到输出面板
-            self.server_output.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
-            self.command_log.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
-        else:
-            # 浅色模式样式
-            self.server_output.setStyleSheet('background-color: white; color: black; border: 1px solid #d0d0d0;')
-            self.command_log.setStyleSheet('background-color: white; color: black; border: 1px solid #d0d0d0;')
-        
-        # 保存设置
-        self.save_settings()
     
     def load_settings(self):
         if os.path.exists(self.settings_file):
@@ -973,8 +1152,6 @@ class ServerAssistant(QMainWindow):
                     settings = json.load(f)
                     if 'layout_params' in settings:
                         self.layout_params.update(settings['layout_params'])
-                    if 'dark_mode' in settings:
-                        self.dark_mode = settings['dark_mode']
                     if 'last_local_dir' in settings:
                         self.last_local_dir = settings['last_local_dir']
             except Exception as e:
@@ -984,7 +1161,6 @@ class ServerAssistant(QMainWindow):
         try:
             settings = {
                 'layout_params': self.layout_params,
-                'dark_mode': self.dark_mode,
                 'last_local_dir': self.last_local_dir
             }
             with open(self.settings_file, 'w', encoding='utf-8') as f:
@@ -1073,35 +1249,10 @@ class ServerAssistant(QMainWindow):
         self.default_command_layout = QVBoxLayout()
         # 设置顶对齐
         self.default_command_layout.setAlignment(Qt.AlignTop)
+        self.default_command_panel.setObjectName('commandPanel')
         self.default_command_panel.setLayout(self.default_command_layout)
-        # 添加现代化样式，去除边框
-        self.default_command_panel.setStyleSheet('''
-            QWidget {
-                background-color: white;
-                padding: 10px;
-            }
-            QLabel {
-                color: #333333;
-                font-weight: bold;
-                margin-bottom: 5px;
-            }
-            QPushButton {
-                background-color: #ffffff;
-                color: #333333;
-                border: 1px solid #d9d9d9;
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #f0f5ff;
-                border-color: #1890ff;
-                color: #1890ff;
-            }
-            QPushButton:pressed {
-                background-color: #e6f7ff;
-            }
-        ''')
+        # 背景色由全局 QSS 通过 #commandPanel 接管
+        self.default_command_panel.setStyleSheet('')
         
         self.command_scroll_area.setWidget(self.default_command_panel)
         
@@ -1115,7 +1266,7 @@ class ServerAssistant(QMainWindow):
         self.server_output = DraggableTextEdit()
         self.server_output.setReadOnly(True)
         self.server_output.setText('系统就绪，等待连接...\n\n提示：可将文件拖拽到此区域上传到服务器当前目录')
-        self.server_output.setStyleSheet('background-color: white; color: black;')
+        self.server_output.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
         self.server_output.setAcceptRichText(True)
         self.server_output.setLineWrapMode(QTextEdit.WidgetWidth)
         self.server_output.files_dropped.connect(self.on_files_dropped)
@@ -1124,7 +1275,7 @@ class ServerAssistant(QMainWindow):
         self.command_log = QTextEdit()
         self.command_log.setReadOnly(True)
         self.command_log.setText('指令执行日志:\n')
-        self.command_log.setStyleSheet('background-color: white; color: black;')
+        self.command_log.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
         
         # 添加页签
         self.output_tabs.addTab(self.server_output, '服务器返回')
@@ -1133,17 +1284,6 @@ class ServerAssistant(QMainWindow):
         # 命令输入框
         self.command_input = CommandLineEdit()
         self.command_input.setPlaceholderText('输入命令后按回车执行 (Tab键自动补全)')
-        self.command_input.setStyleSheet('''
-            QLineEdit {
-                padding: 8px;
-                border: 1px solid #d9d9d9;
-                border-radius: 4px;
-                font-size: 13px;
-            }
-            QLineEdit:focus {
-                border-color: #1890ff;
-            }
-        ''')
         self.command_input.returnPressed.connect(self.on_command_input_return)
         
         # 禁用Tab键切换焦点，用于自动补全
@@ -1160,7 +1300,6 @@ class ServerAssistant(QMainWindow):
         command_input_layout = QVBoxLayout(command_input_widget)
         command_input_layout.setContentsMargins(5, 5, 5, 5)
         command_input_label = QLabel('命令输入:')
-        command_input_label.setStyleSheet('font-weight: bold; color: #333333;')
         command_input_layout.addWidget(command_input_label)
         command_input_layout.addWidget(self.command_input)
         command_input_widget.setMinimumHeight(70)
@@ -1237,19 +1376,14 @@ class ServerAssistant(QMainWindow):
         layout_settings_action.triggered.connect(self.show_layout_settings)
         settings_menu.addAction(layout_settings_action)
         
-        # 添加深色模式切换选项
-        self.dark_mode_action = QAction('深色模式', self)
-        self.dark_mode_action.setCheckable(True)
-        self.dark_mode_action.setChecked(self.dark_mode)
-        self.dark_mode_action.triggered.connect(self.toggle_dark_mode)
-        settings_menu.addAction(self.dark_mode_action)
-        
         self.setCentralWidget(central_widget)
         
-        # 应用深色模式设置
-        if self.dark_mode:
-            self.server_output.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
-            self.command_log.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
+        # 应用全局浅色样式表
+        self.setStyleSheet(LIGHT_QSS)
+        
+        # 输出面板始终深色（终端风格）
+        self.server_output.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d; border-radius: 0px;')
+        self.command_log.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d; border-radius: 0px;')
         
         # 信号连接
         self.server_list_widget.itemClicked.connect(self.on_server_clicked)
@@ -1268,11 +1402,9 @@ class ServerAssistant(QMainWindow):
         for server in self.server_manager.servers:
             item = QListWidgetItem(server['name'])
             if self.server_manager.is_connected(server['name']):
-                item.setForeground(QColor('green'))
-                item.setText(f"{server['name']} (已连接)")
+                item.setIcon(create_status_icon('#4caf50'))
             else:
-                item.setForeground(QColor('red'))
-                item.setText(f"{server['name']} (断开)")
+                item.setIcon(create_status_icon('#ff5252'))
             self.server_list_widget.addItem(item)
     
     def refresh_command_tree(self):
@@ -1305,11 +1437,12 @@ class ServerAssistant(QMainWindow):
     def delete_server(self):
         current_row = self.server_list_widget.currentRow()
         if current_row >= 0:
+            server_name = self.server_list_widget.item(current_row).text()
             self.server_manager.remove_server(current_row)
             self.refresh_server_list()
             # 移除对应的服务器页签
             for i in range(self.server_tabs.count()):
-                if self.server_tabs.tabText(i) == self.server_list_widget.item(current_row).text().split(' ')[0]:
+                if self.server_tabs.tabText(i) == server_name:
                     self.server_tabs.removeTab(i)
                     break
     
@@ -1324,12 +1457,12 @@ class ServerAssistant(QMainWindow):
             rename_action = QAction('重命名', self)
             delete_action = QAction('删除', self)
             
-            connect_action.triggered.connect(lambda: self.connect_server(item.text().split(' ')[0]))
-            disconnect_action.triggered.connect(lambda: self.disconnect_server(item.text().split(' ')[0]))
+            connect_action.triggered.connect(lambda: self.connect_server(item.text()))
+            disconnect_action.triggered.connect(lambda: self.disconnect_server(item.text()))
             edit_action.triggered.connect(lambda: self.edit_server(self.server_list_widget.row(item)))
             copy_action.triggered.connect(lambda: self.copy_server(self.server_list_widget.row(item)))
             rename_action.triggered.connect(lambda: self.rename_server(self.server_list_widget.row(item)))
-            delete_action.triggered.connect(lambda: self.delete_server_by_name(item.text().split(' ')[0]))
+            delete_action.triggered.connect(lambda: self.delete_server_by_name(item.text()))
             
             menu.addAction(connect_action)
             menu.addAction(disconnect_action)
@@ -1357,8 +1490,8 @@ class ServerAssistant(QMainWindow):
                 # 初始化当前目录
                 client = self.server_manager.get_connection(server_name)
                 if client:
-                    stdin, stdout, stderr = client.exec_command('pwd')
-                    current_dir = stdout.read().decode('utf-8').strip()
+                    stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                    current_dir = stdout.read().decode('utf-8', errors='replace').strip()
                     self.current_dirs[server_name] = current_dir
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 初始化当前目录: {current_dir}")
             else:
@@ -1426,7 +1559,7 @@ class ServerAssistant(QMainWindow):
                 output = ""
                 try:
                     while shell.recv_ready():
-                        output += shell.recv(4096).decode('utf-8')
+                        output += shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
                     if output:
                         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 刷新输出，读取到 {len(output)} 字符")
                         highlighted_text = self.highlight_keywords(output)
@@ -1457,32 +1590,9 @@ class ServerAssistant(QMainWindow):
         command_buttons_widget.setLayout(command_buttons_layout)
         # 设置大小策略
         command_buttons_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # 添加现代化样式，去除边框
-        command_buttons_widget.setStyleSheet('''
-            QWidget {
-                background-color: white;
-                padding: 10px;
-            }
-            QLabel {
-                color: #333333;
-                font-weight: bold;
-                margin-bottom: 5px;
-            }
-            QPushButton {
-                background-color: #f9f9f9;
-                color: #333333;
-                border: 1px solid #e0e0e0;
-                border-radius: 4px;
-                padding: 5px 10px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #f0f0f0;
-            }
-            QPushButton:pressed {
-                background-color: #e0e0e0;
-            }
-        ''')
+        # 背景色由全局 QSS 通过 #commandPanel 接管
+        command_buttons_widget.setObjectName('commandPanel')
+        command_buttons_widget.setStyleSheet('')
         
         # 存储布局到字典
         self.server_button_layouts[server_name] = command_buttons_layout
@@ -1504,22 +1614,7 @@ class ServerAssistant(QMainWindow):
         layout = self.server_button_layouts[server_name]
         
         # 清空现有按钮
-        for i in reversed(range(layout.count())):
-            item = layout.itemAt(i)
-            if item:
-                widget = item.widget()
-                if widget:
-                    widget.deleteLater()
-                else:
-                    sub_layout = item.layout()
-                    if sub_layout:
-                        for j in reversed(range(sub_layout.count())):
-                            sub_item = sub_layout.itemAt(j)
-                            if sub_item:
-                                sub_widget = sub_item.widget()
-                                if sub_widget:
-                                    sub_widget.deleteLater()
-                        layout.removeItem(item)
+        clear_layout(layout)
         
         # 添加指令按钮
         self.add_command_buttons_to_layout(layout, server_name)
@@ -1536,9 +1631,9 @@ class ServerAssistant(QMainWindow):
         
         if not server_name:
             # 尝试从左侧服务器列表获取选中的服务器
-            selected_items = self.server_list.selectedItems()
+            selected_items = self.server_list_widget.selectedItems()
             if selected_items:
-                server_name = selected_items[0].text(0)
+                server_name = selected_items[0].text()
         
         if not server_name:
             QMessageBox.warning(self, '未选择服务器', '请先连接或选择一个服务器')
@@ -1612,8 +1707,9 @@ class ServerAssistant(QMainWindow):
             return
         
         try:
-            stdin, stdout, stderr = client.exec_command(f'ls -la "{current_dir}"', timeout=5)
-            output = stdout.read().decode('utf-8')
+            safe_dir = current_dir.replace('"', '\\"')
+            stdin, stdout, stderr = client.exec_command(f'ls -la "{safe_dir}"', timeout=TIMEOUT_EXEC_MEDIUM)
+            output = stdout.read().decode('utf-8', errors='replace')
             
             # 解析文件列表
             files = []
@@ -1621,7 +1717,7 @@ class ServerAssistant(QMainWindow):
                 if not line.strip():
                     continue
                 parts = line.split()
-                if len(parts) >= 8:
+                if len(parts) >= 9:
                     filename = parts[-1]
                     # 排除 . 和 ..
                     if filename not in ['.', '..']:
@@ -1635,85 +1731,75 @@ class ServerAssistant(QMainWindow):
                 all_commands = list(set(self.command_completer_model + files))
                 all_commands.sort()
                 self.command_completer.setModel(None)
-                self.command_completerModel = QStringListModel(all_commands)
-                self.command_completer.setModel(self.command_completerModel)
+                self.command_completer_model = all_commands
+                self.command_completer.setModel(QStringListModel(all_commands))
         except Exception:
             pass
     
     def refresh_default_command_buttons(self):
         # 清空现有按钮
-        for i in reversed(range(self.default_command_layout.count())):
-            item = self.default_command_layout.itemAt(i)
-            if item:
-                widget = item.widget()
-                if widget:
-                    widget.deleteLater()
-                else:
-                    sub_layout = item.layout()
-                    if sub_layout:
-                        for j in reversed(range(sub_layout.count())):
-                            sub_item = sub_layout.itemAt(j)
-                            if sub_item:
-                                sub_widget = sub_item.widget()
-                                if sub_widget:
-                                    sub_widget.deleteLater()
-                        self.default_command_layout.removeItem(item)
+        clear_layout(self.default_command_layout)
         
         # 添加指令按钮
         self.add_command_buttons_to_layout(self.default_command_layout, None)
     
     def add_command_buttons_to_layout(self, layout, server_name):
         # 清空现有内容
-        for i in reversed(range(layout.count())):
-            item = layout.itemAt(i)
-            if item:
-                widget = item.widget()
-                if widget:
-                    widget.deleteLater()
+        clear_layout(layout)
         
         # 创建一个主容器widget来容纳所有按钮
         main_container = QWidget()
         main_layout = QVBoxLayout()
         main_layout.setAlignment(Qt.AlignTop)
-        # 设置默认垂直间距为0，后续手动控制所有间距
         main_layout.setSpacing(0)
-        # 去除布局的默认边距
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setContentsMargins(12, 12, 12, 12)
         main_container.setLayout(main_layout)
+        
+        # 指令按钮面板样式
+        main_container.setStyleSheet('''
+            QLabel {
+                color: #1a1a1a;
+                font-weight: bold;
+                font-size: 14px;
+                padding-left: 8px;
+                border-left: 3px solid #1890ff;
+                margin-top: 16px;
+                margin-bottom: 10px;
+            }
+            QPushButton {
+                background-color: #f8f9fa;
+                color: #333333;
+                border: 0.5px solid #e0e0e0;
+                border-radius: 8px;
+                padding: 5px 10px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #e6f7ff;
+                border-color: #1890ff;
+                color: #1890ff;
+            }
+            QPushButton:pressed {
+                background-color: #bae0ff;
+            }
+        ''')
         
         # 添加指令按钮
         for i, category in enumerate(self.command_manager.commands):
-            # 如果不是第一个分类，添加分类间距
-            if i > 0:
-                main_layout.addSpacing(self.layout_params['category_spacing'])
-            
             category_label = QLabel(category['name'])
-            # 使用布局参数中的字号
             category_label.setFont(QFont('Arial', self.layout_params['category_font_size'], QFont.Bold))
-            # 设置分类标题的边距，根据行高倍数调整
-            line_height = self.layout_params['category_line_height']
-            category_label.setContentsMargins(0, 0, 0, 0)
-            # 去除QLabel的默认边距
-            category_label.setMargin(0)
-            # 覆盖样式表中的margin-bottom设置
-            category_label.setStyleSheet('margin-bottom: 0px;')
             main_layout.addWidget(category_label)
-            
-            # 在标题和按钮之间添加间距
-            main_layout.addSpacing(self.layout_params['title_button_spacing'])
             
             # 创建网格布局，一行最多6个按钮
             grid_layout = QGridLayout()
             grid_layout.setContentsMargins(0, 0, 0, 0)
             grid_layout.setSpacing(self.layout_params['button_spacing'])
-            # 设置左对齐
             grid_layout.setAlignment(Qt.AlignLeft)
             row = 0
             col = 0
             
             for command in category['commands']:
                 button = QPushButton(command['name'])
-                # 调整按钮大小
                 button.setFixedWidth(self.layout_params['button_width'])
                 button.setFixedHeight(self.layout_params['button_height'])
                 if server_name:
@@ -1921,45 +2007,45 @@ class ServerAssistant(QMainWindow):
             self.append_output(f"开始下载文件: {file_path}<br>")
             
             sftp = client.open_sftp()
-            
             try:
-                sftp.stat(file_path)
-                self.append_output(f"文件存在: {file_path}<br>")
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 文件存在: {file_path}")
-            except Exception as stat_error:
-                error_msg = f"文件不存在: {file_path} ({stat_error})"
-                self.append_output(f"{error_msg}<br>")
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}")
-                sftp.close()
-                return
-            
-            from PyQt5.QtWidgets import QFileDialog
-            file_name = os.path.basename(file_path)
-            default_dir = self.last_local_dir if self.last_local_dir and os.path.exists(self.last_local_dir) else os.getcwd()
-            local_path, _ = QFileDialog.getSaveFileName(
-                self, "保存文件", os.path.join(default_dir, file_name), "All Files (*)"
-            )
-            
-            if local_path:
-                self.last_local_dir = os.path.dirname(local_path)
-                self.save_settings()
-                self.append_output(f"保存到: {local_path}<br>")
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 保存到: {local_path}")
-                
                 try:
-                    sftp.get(file_path, local_path)
-                    success_msg = f"文件已保存到: {local_path}"
-                    self.append_output(f"{success_msg}<br>")
-                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {success_msg}")
-                except Exception as download_error:
-                    error_msg = f"下载失败: {download_error}"
+                    sftp.stat(file_path)
+                    self.append_output(f"文件存在: {file_path}<br>")
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 文件存在: {file_path}")
+                except Exception as stat_error:
+                    error_msg = f"文件不存在: {file_path} ({stat_error})"
                     self.append_output(f"{error_msg}<br>")
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}")
-            else:
-                cancel_msg = "文件保存已取消"
-                self.append_output(f"{cancel_msg}<br>")
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cancel_msg}")
-            sftp.close()
+                    return
+
+                from PyQt5.QtWidgets import QFileDialog
+                file_name = posixpath.basename(file_path)
+                default_dir = self.last_local_dir if self.last_local_dir and os.path.exists(self.last_local_dir) else os.getcwd()
+                local_path, _ = QFileDialog.getSaveFileName(
+                    self, "保存文件", os.path.join(default_dir, file_name), "All Files (*)"
+                )
+
+                if local_path:
+                    self.last_local_dir = os.path.dirname(local_path)
+                    self.save_settings()
+                    self.append_output(f"保存到: {local_path}<br>")
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 保存到: {local_path}")
+
+                    try:
+                        sftp.get(file_path, local_path)
+                        success_msg = f"文件已保存到: {local_path}"
+                        self.append_output(f"{success_msg}<br>")
+                        self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {success_msg}")
+                    except Exception as download_error:
+                        error_msg = f"下载失败: {download_error}"
+                        self.append_output(f"{error_msg}<br>")
+                        self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {error_msg}")
+                else:
+                    cancel_msg = "文件保存已取消"
+                    self.append_output(f"{cancel_msg}<br>")
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {cancel_msg}")
+            finally:
+                sftp.close()
         except Exception as e:
             error_msg = f"下载过程出错: {e}"
             self.append_output(f"{error_msg}<br>")
@@ -2010,41 +2096,17 @@ class ServerAssistant(QMainWindow):
                         try:
                             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从shell获取当前目录")
                             shell.send('pwd\n')
-                            # 多次尝试读取，确保获取到输出
                             pwd_output = ""
-                            max_attempts = 5
                             attempt = 0
-                            while attempt < max_attempts:
-                                time.sleep(0.05)
+                            while attempt < RECV_MAX_ATTEMPTS:
+                                time.sleep(RECV_SHELL_DELAY)
                                 if shell.recv_ready():
-                                    pwd_output += shell.recv(4096).decode('utf-8')
+                                    pwd_output += shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
                                     attempt = 0
                                 else:
                                     attempt += 1
-                            
-                            # 解析输出，获取目录
-                            lines = pwd_output.split('\n')
-                            for line in lines:
-                                stripped_line = line.strip()
-                                # 只要是/开头就行
-                                if stripped_line.startswith('/'):
-                                    # 检查是否包含提示符，如果包含，截取到提示符之前
-                                    prompt_chars = ['$', '#', '%', '>', ']']
-                                    has_prompt = any(c in stripped_line for c in prompt_chars)
-                                    if has_prompt:
-                                        # 找到第一个提示符的位置
-                                        min_pos = len(stripped_line)
-                                        for c in prompt_chars:
-                                            pos = stripped_line.find(c)
-                                            if pos != -1 and pos < min_pos:
-                                                min_pos = pos
-                                        if min_pos < len(stripped_line):
-                                            current_dir = stripped_line[:min_pos].strip()
-                                            break
-                                    else:
-                                        current_dir = stripped_line
-                                        break
-                            
+
+                            current_dir = parse_pwd_output(pwd_output)
                             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 当前目录: {current_dir}")
                         except Exception as e:
                             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
@@ -2052,8 +2114,8 @@ class ServerAssistant(QMainWindow):
                     else:
                         # 没有shell会话，使用exec_command
                         try:
-                            stdin, stdout, stderr = client.exec_command('pwd', timeout=2)
-                            current_dir = stdout.read().decode('utf-8').strip()
+                            stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                            current_dir = stdout.read().decode('utf-8', errors='replace').strip()
                             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从exec_command获取当前目录: {current_dir}")
                         except Exception as e:
                             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
@@ -2068,57 +2130,38 @@ class ServerAssistant(QMainWindow):
     def get_current_directory(self, server_name, client):
         if server_name in self.current_dirs:
             return self.current_dirs[server_name]
-        
+
         shell = self.server_manager.get_shell(server_name)
         current_dir = "/"
-        
+
         if shell:
             try:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从shell获取当前目录")
                 shell.send('pwd\n')
                 pwd_output = ""
-                max_attempts = 5
                 attempt = 0
-                while attempt < max_attempts:
-                    time.sleep(0.05)
+                while attempt < RECV_MAX_ATTEMPTS:
+                    time.sleep(RECV_SHELL_DELAY)
                     if shell.recv_ready():
-                        pwd_output += shell.recv(4096).decode('utf-8')
+                        pwd_output += shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
                         attempt = 0
                     else:
                         attempt += 1
-                
-                lines = pwd_output.split('\n')
-                for line in lines:
-                    stripped_line = line.strip()
-                    if stripped_line.startswith('/'):
-                        prompt_chars = ['$', '#', '%', '>', ']']
-                        has_prompt = any(c in stripped_line for c in prompt_chars)
-                        if has_prompt:
-                            min_pos = len(stripped_line)
-                            for c in prompt_chars:
-                                pos = stripped_line.find(c)
-                                if pos != -1 and pos < min_pos:
-                                    min_pos = pos
-                            if min_pos < len(stripped_line):
-                                current_dir = stripped_line[:min_pos].strip()
-                                break
-                        else:
-                            current_dir = stripped_line
-                            break
-                
+
+                current_dir = parse_pwd_output(pwd_output)
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 当前目录: {current_dir}")
             except Exception as e:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
                 current_dir = "/"
         else:
             try:
-                stdin, stdout, stderr = client.exec_command('pwd', timeout=2)
-                current_dir = stdout.read().decode('utf-8').strip()
+                stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                current_dir = stdout.read().decode('utf-8', errors='replace').strip()
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从exec_command获取当前目录: {current_dir}")
             except Exception as e:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
                 current_dir = "/"
-        
+
         return current_dir
 
     def upload_file(self, server_name):
@@ -2149,19 +2192,19 @@ class ServerAssistant(QMainWindow):
                 self.last_local_dir = os.path.dirname(local_path)
                 self.save_settings()
                 sftp = client.open_sftp()
-                
-                current_dir = self.get_current_directory(server_name, client)
-                self.append_output(f"当前服务器目录: {current_dir}<br>")
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 使用当前目录: {current_dir}")
-                
-                remote_path = current_dir.rstrip('/') + '/' + os.path.basename(local_path)
-                self.append_output(f"尝试上传到: {remote_path}<br>")
-                
                 try:
-                    sftp.put(local_path, remote_path)
-                    self.append_output(f"文件已上传到: {remote_path}<br>")
-                except Exception as upload_error:
-                    self.append_output(f"上传失败: {upload_error}<br>")
+                    current_dir = self.get_current_directory(server_name, client)
+                    self.append_output(f"当前服务器目录: {current_dir}<br>")
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 使用当前目录: {current_dir}")
+
+                    remote_path = current_dir.rstrip('/') + '/' + os.path.basename(local_path)
+                    self.append_output(f"尝试上传到: {remote_path}<br>")
+
+                    try:
+                        sftp.put(local_path, remote_path)
+                        self.append_output(f"文件已上传到: {remote_path}<br>")
+                    except Exception as upload_error:
+                        self.append_output(f"上传失败: {upload_error}<br>")
                 finally:
                     sftp.close()
             else:
@@ -2228,29 +2271,31 @@ class ServerAssistant(QMainWindow):
         
         try:
             sftp = client.open_sftp()
-            success_count = 0
-            fail_count = 0
-            
-            for local_path in files:
-                file_name = os.path.basename(local_path)
-                remote_path = current_dir.rstrip('/') + '/' + file_name
-                
-                self.append_output(f"正在上传: {file_name} -> {remote_path}<br>")
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 拖拽上传: {local_path} -> {remote_path}")
-                
-                try:
-                    sftp.put(local_path, remote_path)
-                    self.append_output(f"上传成功: {file_name}<br>")
-                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传成功: {file_name}")
-                    success_count += 1
-                except Exception as e:
-                    self.append_output(f"上传失败: {file_name} - {e}<br>")
-                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传失败: {file_name} - {e}")
-                    fail_count += 1
-            
-            sftp.close()
-            self.append_output(f"<br>上传完成: 成功 {success_count} 个，失败 {fail_count} 个<br>")
-            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 批量上传完成: 成功 {success_count}，失败 {fail_count}")
+            try:
+                success_count = 0
+                fail_count = 0
+
+                for local_path in files:
+                    file_name = os.path.basename(local_path)
+                    remote_path = current_dir.rstrip('/') + '/' + file_name
+
+                    self.append_output(f"正在上传: {file_name} -> {remote_path}<br>")
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 拖拽上传: {local_path} -> {remote_path}")
+
+                    try:
+                        sftp.put(local_path, remote_path)
+                        self.append_output(f"上传成功: {file_name}<br>")
+                        self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传成功: {file_name}")
+                        success_count += 1
+                    except Exception as e:
+                        self.append_output(f"上传失败: {file_name} - {e}<br>")
+                        self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 上传失败: {file_name} - {e}")
+                        fail_count += 1
+
+                self.append_output(f"<br>上传完成: 成功 {success_count} 个，失败 {fail_count} 个<br>")
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 批量上传完成: 成功 {success_count}，失败 {fail_count}")
+            finally:
+                sftp.close()
             
         except Exception as e:
             self.append_output(f"上传过程出错: {e}<br>")
@@ -2484,7 +2529,7 @@ class ServerAssistant(QMainWindow):
             QMessageBox.warning(self, '导入失败', f'配置文件不存在: {file_path}')
     
     def on_server_clicked(self, item):
-        server_name = item.text().split(' ')[0]
+        server_name = item.text()
         if self.server_manager.is_connected(server_name):
             self.add_server_tab(server_name)
         else:
@@ -2551,8 +2596,8 @@ class ServerAssistant(QMainWindow):
                 client = self.server_manager.get_connection(server_name)
                 if client:
                     try:
-                        stdin, stdout, stderr = client.exec_command('pwd')
-                        current_dir = stdout.read().decode('utf-8').strip()
+                        stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                        current_dir = stdout.read().decode('utf-8', errors='replace').strip()
                         self.current_dirs[server_name] = current_dir
                         self.server_output.append(f'当前目录: {current_dir}')
                     except Exception as e:
@@ -2656,9 +2701,6 @@ class LayoutSettingsDialog(QDialog):
         except ValueError:
             # 如果输入无效，返回原始参数
             return self.layout_params
-
-# 导入QInputDialog
-from PyQt5.QtWidgets import QInputDialog
 
 if __name__ == '__main__':
     # 设置当前工作目录为程序所在目录（支持PyInstaller打包）
