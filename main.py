@@ -744,14 +744,15 @@ class ServerDialog(QDialog):
         }
 
 class CommandDialog(QDialog):
-    def __init__(self, command_info=None, command_manager=None, parent=None):
+    def __init__(self, command_info=None, command_manager=None, server_manager=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle('编辑指令' if command_info else '添加指令')
-        self.setGeometry(100, 100, 500, 350)
+        self.setGeometry(100, 100, 500, 400)
         if parent:
             self.move(parent.frameGeometry().center() - self.frameGeometry().center())
         
         self.command_manager = command_manager
+        self.server_manager = server_manager
         
         layout = QVBoxLayout()
         
@@ -785,6 +786,11 @@ class CommandDialog(QDialog):
         self.linked_delay_spinbox.setSuffix(' 毫秒')
         self.linked_delay_spinbox.setEnabled(False)
         form_layout.addRow('延迟时长:', self.linked_delay_spinbox)
+        
+        # 目标服务器配置
+        self.target_server_combo = QComboBox()
+        self.load_target_servers()
+        form_layout.addRow('目标服务器:', self.target_server_combo)
         
         layout.addLayout(form_layout)
         
@@ -830,6 +836,15 @@ class CommandDialog(QDialog):
                             self.add_param(param['name'], param.get('hint', ''))
                         elif isinstance(param, str):
                             self.add_param(param, '')
+            # 恢复目标服务器配置
+            target_server = command_info.get('target_server')
+            if target_server:
+                for i in range(self.target_server_combo.count()):
+                    data = self.target_server_combo.itemData(i)
+                    if data == target_server:
+                        self.target_server_combo.setCurrentIndex(i)
+                        break
+            
             # 恢复关联指令配置
             if command_info.get('linked_enabled'):
                 self.enable_linked_checkbox.setChecked(True)
@@ -849,6 +864,14 @@ class CommandDialog(QDialog):
         if self.command_manager:
             for category in self.command_manager.commands:
                 self.category_combo.addItem(category['name'])
+    
+    def load_target_servers(self):
+        # 加载服务器列表供目标服务器选择
+        self.target_server_combo.clear()
+        self.target_server_combo.addItem('当前服务器（默认）', None)
+        if self.server_manager:
+            for server in self.server_manager.servers:
+                self.target_server_combo.addItem(server['name'], server['name'])
     
     def load_linked_commands(self):
         # 加载所有指令供关联选择
@@ -920,6 +943,7 @@ class CommandDialog(QDialog):
             data = self.linked_command_combo.currentData()
             if data:
                 linked_command = data
+        target_server = self.target_server_combo.currentData()
         return {
             'name': self.name_edit.text(),
             'command': self.command_edit.text(),
@@ -927,7 +951,8 @@ class CommandDialog(QDialog):
             'continuous': self.continuous_output_checkbox.isChecked(),
             'linked_enabled': self.enable_linked_checkbox.isChecked(),
             'linked_command': linked_command,
-            'linked_delay': self.linked_delay_spinbox.value()
+            'linked_delay': self.linked_delay_spinbox.value(),
+            'target_server': target_server
         }
     
     def get_category(self):
@@ -1892,6 +1917,15 @@ class ServerAssistant(QMainWindow):
         return None
 
     def execute_command(self, server_name, command_info, from_linked=False):
+        # 仅主指令可切换目标服务器，关联指令继承主指令解析后的服务器
+        if not from_linked:
+            target = command_info.get('target_server')
+            if target:
+                server_name = target
+                if not self.server_manager.ensure_connection(server_name):
+                    self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 错误: 无法连接到目标服务器 {server_name}")
+                    return
+        
         # 处理前置关联指令（仅主指令触发，避免递归）
         if not from_linked and command_info.get('linked_enabled'):
             linked_spec = command_info.get('linked_command')
@@ -2050,6 +2084,15 @@ class ServerAssistant(QMainWindow):
             self.command_log.append(f"  {error_msg}")
     
     def execute_default_command(self, command_info):
+        # 如果指令配置了目标服务器，优先定向执行
+        target = command_info.get('target_server')
+        if target:
+            if not self.server_manager.ensure_connection(target):
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 错误: 无法连接到目标服务器 {target}")
+                return
+            self.execute_command(target, command_info)
+            return
+        
         # 获取已连接的服务器列表
         connected_servers = [server['name'] for server in self.server_manager.servers if self.server_manager.is_connected(server['name'])]
         
@@ -2398,7 +2441,7 @@ class ServerAssistant(QMainWindow):
             self.refresh_default_command_buttons()
     
     def add_command(self):
-        dialog = CommandDialog(command_manager=self.command_manager, parent=self)
+        dialog = CommandDialog(command_manager=self.command_manager, server_manager=self.server_manager, parent=self)
         if dialog.exec_():
             category_name = dialog.get_category()
             if category_name:
@@ -2421,7 +2464,7 @@ class ServerAssistant(QMainWindow):
             category_index = self.command_tree.indexOfTopLevelItem(category_item)
             command_index = category_item.indexOfChild(item)
             command_info = self.command_manager.commands[category_index]['commands'][command_index]
-            dialog = CommandDialog(command_info, command_manager=self.command_manager, parent=self)
+            dialog = CommandDialog(command_info, command_manager=self.command_manager, server_manager=self.server_manager, parent=self)
             # 设置默认分类为原始指令的分类
             category_name = category_item.text(0)
             dialog.category_combo.setCurrentText(category_name)
@@ -2471,7 +2514,7 @@ class ServerAssistant(QMainWindow):
         category_index = self.command_tree.indexOfTopLevelItem(category_item)
         command_index = category_item.indexOfChild(item)
         command_info = self.command_manager.commands[category_index]['commands'][command_index]
-        dialog = CommandDialog(command_info, command_manager=self.command_manager, parent=self)
+        dialog = CommandDialog(command_info, command_manager=self.command_manager, server_manager=self.server_manager, parent=self)
         # 设置默认分类为原始指令的分类
         category_name = category_item.text(0)
         dialog.category_combo.setCurrentText(category_name)
@@ -2501,7 +2544,7 @@ class ServerAssistant(QMainWindow):
     
     def add_command_to_category(self, category_item):
         category_name = category_item.text(0)
-        dialog = CommandDialog(command_manager=self.command_manager, parent=self)
+        dialog = CommandDialog(command_manager=self.command_manager, server_manager=self.server_manager, parent=self)
         # 设置默认分类
         dialog.category_combo.setCurrentText(category_name)
         if dialog.exec_():
