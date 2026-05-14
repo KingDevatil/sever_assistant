@@ -21,10 +21,13 @@ class TestExecuteCommandTargetServer(unittest.TestCase):
         cmd = {'name': '指令A', 'command': 'echo A', 'target_server': 'srvB'}
         self.sa.server_manager.ensure_connection.return_value = True
 
-        with patch.object(self.sa, '_execute_command_main') as mock_main:
+        with patch.object(self.sa, '_execute_command_main') as mock_main, \
+             patch.object(self.sa, '_ensure_server_ui_ready') as mock_ready:
             self.sa.execute_command('srv1', cmd)
             # ensure_connection 被调用以确认目标服务器已连接
             self.sa.server_manager.ensure_connection.assert_called_once_with('srvB')
+            # _ensure_server_ui_ready 被调用以刷新 UI
+            mock_ready.assert_called_once_with('srvB')
             # _execute_command_main 使用目标服务器名称
             mock_main.assert_called_once_with('srvB', cmd)
 
@@ -33,9 +36,11 @@ class TestExecuteCommandTargetServer(unittest.TestCase):
         cmd = {'name': '指令A', 'command': 'echo A', 'target_server': 'srvB'}
         self.sa.server_manager.ensure_connection.return_value = True
 
-        with patch.object(self.sa, '_execute_command_main') as mock_main:
+        with patch.object(self.sa, '_execute_command_main') as mock_main, \
+             patch.object(self.sa, '_ensure_server_ui_ready') as mock_ready:
             self.sa.execute_command('srv1', cmd)
             self.sa.server_manager.ensure_connection.assert_called_once_with('srvB')
+            mock_ready.assert_called_once_with('srvB')
             mock_main.assert_called_once_with('srvB', cmd)
 
     def test_execute_command_target_server_connect_failed(self):

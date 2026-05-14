@@ -1651,11 +1651,12 @@ class ServerAssistant(QMainWindow):
         else:
             QMessageBox.information(self, '提示', '请先选择一个服务器页签')
     
-    def add_server_tab(self, server_name):
+    def add_server_tab(self, server_name, switch=True):
         # 检查是否已存在该服务器的页签
         for i in range(self.server_tabs.count()):
             if self.server_tabs.tabText(i) == server_name:
-                self.server_tabs.setCurrentIndex(i)
+                if switch:
+                    self.server_tabs.setCurrentIndex(i)
                 return
         
         # 创建新的服务器页签
@@ -1681,10 +1682,26 @@ class ServerAssistant(QMainWindow):
         self.refresh_command_buttons(server_name)
         
         tab_layout.addWidget(command_buttons_widget)
-        self.server_tabs.addTab(tab_widget, server_name)
+        index = self.server_tabs.addTab(tab_widget, server_name)
+        if switch:
+            self.server_tabs.setCurrentIndex(index)
         
         # 连接服务器后更新文件补全
         self.update_command_completer_with_files()
+    
+    def _ensure_server_ui_ready(self, server_name):
+        """确保服务器在 UI 中已就绪：刷新列表、创建页签（不切换）、初始化当前目录"""
+        self.refresh_server_list()
+        self.add_server_tab(server_name, switch=False)
+        if server_name not in self.current_dirs:
+            try:
+                client = self.server_manager.get_connection(server_name)
+                if client:
+                    stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                    current_dir = stdout.read().decode('utf-8', errors='replace').strip()
+                    self.current_dirs[server_name] = current_dir
+            except Exception:
+                self.current_dirs[server_name] = '/'
     
     def refresh_command_buttons(self, server_name):
         # 获取对应服务器的布局
@@ -1925,6 +1942,7 @@ class ServerAssistant(QMainWindow):
                 if not self.server_manager.ensure_connection(server_name):
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 错误: 无法连接到目标服务器 {server_name}")
                     return
+                self._ensure_server_ui_ready(server_name)
         
         # 处理前置关联指令（仅主指令触发，避免递归）
         if not from_linked and command_info.get('linked_enabled'):
