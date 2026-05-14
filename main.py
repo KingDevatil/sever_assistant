@@ -1700,6 +1700,8 @@ class ServerAssistant(QMainWindow):
                     stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
                     current_dir = stdout.read().decode('utf-8', errors='replace').strip()
                     self.current_dirs[server_name] = current_dir
+                else:
+                    self.current_dirs[server_name] = '/'
             except Exception:
                 self.current_dirs[server_name] = '/'
     

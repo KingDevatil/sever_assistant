@@ -168,5 +168,58 @@ class TestCommandDialogTargetServer(unittest.TestCase):
         self.assertEqual(dialog.target_server_combo.currentData(), 'srvA')
 
 
+class TestEnsureServerUiReady(unittest.TestCase):
+    def setUp(self):
+        with patch.object(main.ServerAssistant, '__init__', lambda x: None):
+            self.sa = main.ServerAssistant()
+        self.sa.server_manager = MagicMock()
+        self.sa.current_dirs = {}
+
+    def test_refreshes_server_list(self):
+        """自动连接后刷新左侧服务器列表"""
+        with patch.object(self.sa, 'refresh_server_list') as mock_refresh, \
+             patch.object(self.sa, 'add_server_tab'):
+            self.sa._ensure_server_ui_ready('srvB')
+            mock_refresh.assert_called_once()
+
+    def test_adds_tab_without_switching(self):
+        """为目标服务器创建页签，但不切换当前页签"""
+        with patch.object(self.sa, 'refresh_server_list'), \
+             patch.object(self.sa, 'add_server_tab') as mock_add:
+            self.sa._ensure_server_ui_ready('srvB')
+            mock_add.assert_called_once_with('srvB', switch=False)
+
+    def test_initializes_current_dir(self):
+        """自动连接后初始化目标服务器的当前目录"""
+        client = MagicMock()
+        stdout = MagicMock()
+        stdout.read.return_value = b'/home/user\n'
+        client.exec_command.return_value = (None, stdout, None)
+        self.sa.server_manager.get_connection.return_value = client
+
+        with patch.object(self.sa, 'refresh_server_list'), \
+             patch.object(self.sa, 'add_server_tab'):
+            self.sa._ensure_server_ui_ready('srvB')
+            self.assertEqual(self.sa.current_dirs['srvB'], '/home/user')
+
+    def test_does_not_override_existing_current_dir(self):
+        """已存在 current_dirs 时不重复初始化"""
+        self.sa.current_dirs['srvB'] = '/existing'
+        with patch.object(self.sa, 'refresh_server_list'), \
+             patch.object(self.sa, 'add_server_tab'), \
+             patch.object(self.sa.server_manager, 'get_connection') as mock_get:
+            self.sa._ensure_server_ui_ready('srvB')
+            mock_get.assert_not_called()
+            self.assertEqual(self.sa.current_dirs['srvB'], '/existing')
+
+    def test_sets_default_dir_on_exception(self):
+        """获取当前目录失败时默认设置为根目录"""
+        self.sa.server_manager.get_connection.return_value = None
+        with patch.object(self.sa, 'refresh_server_list'), \
+             patch.object(self.sa, 'add_server_tab'):
+            self.sa._ensure_server_ui_ready('srvB')
+            self.assertEqual(self.sa.current_dirs['srvB'], '/')
+
+
 if __name__ == '__main__':
     unittest.main()
