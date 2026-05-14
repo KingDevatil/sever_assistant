@@ -3,7 +3,7 @@
 
 import sys
 import re
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter, QInputDialog
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter, QInputDialog, QSpinBox
 from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject, QStringListModel
 from PyQt5.QtGui import QFont, QColor, QTextCursor, QIntValidator, QPixmap, QPainter
 import paramiko
@@ -171,7 +171,7 @@ QWidget#commandPanel {
 def get_base_dir():
     """获取程序所在目录（支持 PyInstaller 打包）"""
     if hasattr(sys, '_MEIPASS'):
-        return sys._MEIPASS
+        return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -769,6 +769,23 @@ class CommandDialog(QDialog):
         form_layout.addRow('指令内容:', self.command_edit)
         form_layout.addRow('', self.continuous_output_checkbox)
         
+        # 前置关联指令配置
+        self.enable_linked_checkbox = QCheckBox('启用前置关联指令')
+        self.enable_linked_checkbox.stateChanged.connect(self.toggle_linked_controls)
+        form_layout.addRow('', self.enable_linked_checkbox)
+        
+        self.linked_command_combo = QComboBox()
+        self.linked_command_combo.setEnabled(False)
+        self.load_linked_commands()
+        form_layout.addRow('关联指令:', self.linked_command_combo)
+        
+        self.linked_delay_spinbox = QSpinBox()
+        self.linked_delay_spinbox.setRange(0, 60000)
+        self.linked_delay_spinbox.setSingleStep(100)
+        self.linked_delay_spinbox.setSuffix(' 毫秒')
+        self.linked_delay_spinbox.setEnabled(False)
+        form_layout.addRow('延迟时长:', self.linked_delay_spinbox)
+        
         layout.addLayout(form_layout)
         
         param_layout = QVBoxLayout()
@@ -813,12 +830,42 @@ class CommandDialog(QDialog):
                             self.add_param(param['name'], param.get('hint', ''))
                         elif isinstance(param, str):
                             self.add_param(param, '')
+            # 恢复关联指令配置
+            if command_info.get('linked_enabled'):
+                self.enable_linked_checkbox.setChecked(True)
+                linked = command_info.get('linked_command')
+                if linked and isinstance(linked, dict):
+                    for i in range(self.linked_command_combo.count()):
+                        data = self.linked_command_combo.itemData(i)
+                        if data and data.get('category') == linked.get('category') and data.get('name') == linked.get('name'):
+                            self.linked_command_combo.setCurrentIndex(i)
+                            break
+                self.linked_delay_spinbox.setValue(command_info.get('linked_delay', 0))
+            else:
+                self.linked_delay_spinbox.setValue(command_info.get('linked_delay', 0))
     
     def load_categories(self):
         # 加载分类列表
         if self.command_manager:
             for category in self.command_manager.commands:
                 self.category_combo.addItem(category['name'])
+    
+    def load_linked_commands(self):
+        # 加载所有指令供关联选择
+        if not self.command_manager:
+            return
+        self.linked_command_combo.clear()
+        self.linked_command_combo.addItem('请选择...', None)
+        for category in self.command_manager.commands:
+            for command in category.get('commands', []):
+                display = f"{category['name']} / {command['name']}"
+                data = {'category': category['name'], 'name': command['name']}
+                self.linked_command_combo.addItem(display, data)
+    
+    def toggle_linked_controls(self, state):
+        enabled = state == Qt.Checked
+        self.linked_command_combo.setEnabled(enabled)
+        self.linked_delay_spinbox.setEnabled(enabled)
     
     def add_param(self, param_name='', param_hint=''):
         param_widget = QWidget()
@@ -868,11 +915,19 @@ class CommandDialog(QDialog):
                     'name': param_name,
                     'hint': hint_edit.text()
                 })
+        linked_command = None
+        if self.enable_linked_checkbox.isChecked():
+            data = self.linked_command_combo.currentData()
+            if data:
+                linked_command = data
         return {
             'name': self.name_edit.text(),
             'command': self.command_edit.text(),
             'params': params,
-            'continuous': self.continuous_output_checkbox.isChecked()
+            'continuous': self.continuous_output_checkbox.isChecked(),
+            'linked_enabled': self.enable_linked_checkbox.isChecked(),
+            'linked_command': linked_command,
+            'linked_delay': self.linked_delay_spinbox.value()
         }
     
     def get_category(self):
@@ -1821,7 +1876,40 @@ class ServerAssistant(QMainWindow):
         # 将主容器添加到布局中
         layout.addWidget(main_container)
     
-    def execute_command(self, server_name, command_info):
+    def find_linked_command(self, linked_spec):
+        """根据关联指令配置查找对应的指令信息"""
+        if not linked_spec or not isinstance(linked_spec, dict):
+            return None
+        target_category = linked_spec.get('category')
+        target_name = linked_spec.get('name')
+        if not target_category or not target_name:
+            return None
+        for category in self.command_manager.commands:
+            if category.get('name') == target_category:
+                for command in category.get('commands', []):
+                    if command.get('name') == target_name:
+                        return command
+        return None
+
+    def execute_command(self, server_name, command_info, from_linked=False):
+        # 处理前置关联指令（仅主指令触发，避免递归）
+        if not from_linked and command_info.get('linked_enabled'):
+            linked_spec = command_info.get('linked_command')
+            linked_cmd = self.find_linked_command(linked_spec) if linked_spec else None
+            if linked_cmd:
+                delay = command_info.get('linked_delay', 0)
+                # 先执行关联指令（标记为 from_linked=True，防止递归触发关联）
+                self.execute_command(server_name, linked_cmd, from_linked=True)
+                # 延迟后执行自身指令
+                QTimer.singleShot(delay, lambda: self._execute_command_main(server_name, command_info))
+                return
+            else:
+                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 警告: 未找到关联指令，继续执行当前指令")
+        
+        self._execute_command_main(server_name, command_info)
+    
+    def _execute_command_main(self, server_name, command_info):
+        """执行指令的主体逻辑（连接检查、持续运行冲突检查等）"""
         command = command_info['command']
         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 执行命令: {command}")
         

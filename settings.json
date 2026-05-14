@@ -1,7 +1,7 @@
 {
   "layout_params": {
     "category_spacing": 0,
-    "title_button_spacing": -5,
+    "title_button_spacing": 0,
     "button_spacing": 5,
     "button_width": 150,
     "button_height": 30,
@@ -12,5 +12,6 @@
     "window_width": 1200,
     "window_height": 800
   },
-  "dark_mode": true
+  "dark_mode": false,
+  "last_local_dir": ""
 }
