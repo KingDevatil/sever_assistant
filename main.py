@@ -1069,6 +1069,31 @@ class ServerAssistant(QMainWindow):
         self.connection_check_timer.timeout.connect(self.check_connections_status)
         self.connection_check_timer.start(60000)
     
+    def closeEvent(self, event):
+        """窗口关闭时清理资源，确保进程正常退出"""
+        # 停止当前正在运行的指令
+        if hasattr(self, 'current_runnable') and self.current_runnable:
+            try:
+                self.current_runnable.stop()
+            except Exception:
+                pass
+        
+        # 断开所有服务器连接（关闭 shell 会让后台线程的 recv 立即退出）
+        for server_name in list(self.server_manager.connections.keys()):
+            try:
+                self.server_manager.disconnect_server(server_name)
+            except Exception:
+                pass
+        
+        # 等待线程池中的任务结束（最多1秒）
+        QThreadPool.globalInstance().waitForDone(1000)
+        
+        # 停止连接检测定时器
+        if hasattr(self, 'connection_check_timer'):
+            self.connection_check_timer.stop()
+        
+        event.accept()
+    
     def append_output(self, text, is_html=True):
         with QMutexLocker(self.output_mutex):
             cursor = self.server_output.textCursor()
