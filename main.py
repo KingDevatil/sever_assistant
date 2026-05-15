@@ -1450,7 +1450,7 @@ class ServerAssistant(QMainWindow):
         self.button_layout.addLayout(self.stop_button_layout)
         
         right_layout.addWidget(self.server_tabs)
-        right_layout.addWidget(right_splitter)
+        right_layout.addWidget(self.right_splitter)
         right_layout.addLayout(self.button_layout)
         
         splitter.addWidget(left_panel)
