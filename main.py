@@ -1410,19 +1410,19 @@ class ServerAssistant(QMainWindow):
         command_input_widget.setMinimumHeight(70)
         
         # 使用QSplitter分割输出面板和命令输入框
-        bottom_splitter = QSplitter(Qt.Vertical)
-        bottom_splitter.setFocusPolicy(Qt.NoFocus)
-        bottom_splitter.addWidget(self.output_tabs)
-        bottom_splitter.addWidget(command_input_widget)
-        bottom_splitter.setSizes([self.layout_params['output_panel_height'] - 60, 60])
+        self.bottom_splitter = QSplitter(Qt.Vertical)
+        self.bottom_splitter.setFocusPolicy(Qt.NoFocus)
+        self.bottom_splitter.addWidget(self.output_tabs)
+        self.bottom_splitter.addWidget(command_input_widget)
+        self.bottom_splitter.setSizes([self.layout_params['output_panel_height'] - 60, 60])
         
         # 使用QSplitter分割指令面板和输出面板
-        right_splitter = QSplitter(Qt.Vertical)
-        right_splitter.setFocusPolicy(Qt.NoFocus)
-        right_splitter.addWidget(self.command_scroll_area)
-        right_splitter.addWidget(bottom_splitter)
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.setFocusPolicy(Qt.NoFocus)
+        self.right_splitter.addWidget(self.command_scroll_area)
+        self.right_splitter.addWidget(self.bottom_splitter)
         # 设置默认大小比例
-        right_splitter.setSizes([self.layout_params['command_panel_height'], self.layout_params['output_panel_height']])
+        self.right_splitter.setSizes([self.layout_params['command_panel_height'], self.layout_params['output_panel_height']])
         
         # 添加按钮布局
         self.button_layout = QHBoxLayout()
@@ -1880,32 +1880,32 @@ class ServerAssistant(QMainWindow):
         main_container.setLayout(main_layout)
         
         # 指令按钮面板样式
-        main_container.setStyleSheet('''
-            QLabel {
+        main_container.setStyleSheet(f'''
+            QLabel {{
                 color: #1a1a1a;
                 font-weight: bold;
-                font-size: 14px;
+                font-size: {self.layout_params['category_font_size']}px;
                 padding-left: 8px;
                 border-left: 3px solid #1890ff;
-                margin-top: 16px;
-                margin-bottom: 10px;
-            }
-            QPushButton {
+                margin-top: {self.layout_params['category_spacing']}px;
+                margin-bottom: {self.layout_params['title_button_spacing']}px;
+            }}
+            QPushButton {{
                 background-color: #f8f9fa;
                 color: #333333;
                 border: 0.5px solid #e0e0e0;
                 border-radius: 8px;
                 padding: 5px 10px;
                 font-size: 12px;
-            }
-            QPushButton:hover {
+            }}
+            QPushButton:hover {{
                 background-color: #e6f7ff;
                 border-color: #1890ff;
                 color: #1890ff;
-            }
-            QPushButton:pressed {
+            }}
+            QPushButton:pressed {{
                 background-color: #bae0ff;
-            }
+            }}
         ''')
         
         # 添加指令按钮
@@ -2727,22 +2727,9 @@ class ServerAssistant(QMainWindow):
             for server_name in self.server_button_layouts:
                 layout = self.server_button_layouts[server_name]
                 self.add_command_buttons_to_layout(layout, server_name)
-            # 重新创建右侧分割器，应用新的大小设置
-            # 找到主分割器
-            splitter = self.findChild(QSplitter)
-            if splitter:
-                # 找到右侧面板
-                right_panel = splitter.widget(1)
-                if right_panel:
-                    # 找到右侧面板中的垂直分割器
-                    for i in range(right_panel.layout().count()):
-                        item = right_panel.layout().itemAt(i)
-                        if item:
-                            widget = item.widget()
-                            if isinstance(widget, QSplitter) and widget.orientation() == Qt.Vertical:
-                                # 找到右侧分割器，更新大小
-                                widget.setSizes([self.layout_params['command_panel_height'], self.layout_params['output_panel_height']])
-                                break
+            # 应用新的分割器大小
+            self.right_splitter.setSizes([self.layout_params['command_panel_height'], self.layout_params['output_panel_height']])
+            self.bottom_splitter.setSizes([self.layout_params['output_panel_height'] - 60, 60])
             # 保存设置
             self.save_settings()
     
