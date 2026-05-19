@@ -317,7 +317,7 @@ class CommandRunnable(QRunnable):
                     output_buffer = ""
                     start_time = time.time()
                     
-                    self.signals.partial_result.emit(f"$ {self.command}\n")
+                    # 不再手动发送命令前缀，shell 交互会话本身会回显命令
                     
                     while self.is_running:
                         output = self.recv_with_timeout(0.1)
@@ -405,7 +405,8 @@ class CommandRunnable(QRunnable):
                     
                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                     
-                    full_output = f"$ {self.command}\n{output}"
+                    # shell 交互会话本身会回显命令，不再手动添加前缀
+                    full_output = output
                     self.command_log.append(f"  构建完整输出完成")
                     
                     self.signals.result.emit(full_output)
