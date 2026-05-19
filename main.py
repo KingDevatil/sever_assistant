@@ -1107,12 +1107,24 @@ class ServerAssistant(QMainWindow):
     
     def remove_stop_button(self):
         if hasattr(self, 'stop_button') and self.stop_button:
-            try:
-                self.stop_button_layout.removeWidget(self.stop_button)
-                self.stop_button.deleteLater()
-            except Exception:
-                pass
-            self.stop_button = None
+            self.stop_button.setEnabled(False)
+            self.stop_button.setText('停止命令')
+        self.current_runnable = None
+    
+    def stop_current_command(self):
+        if hasattr(self, 'current_runnable') and self.current_runnable and getattr(self.current_runnable, 'is_running', False):
+            self.current_runnable.stop()
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户停止当前命令")
+        self.remove_stop_button()
+    
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.KeyPress and obj == self.command_input:
+            if event.key() == Qt.Key_C and event.modifiers() == Qt.ControlModifier:
+                if self.command_input.hasSelectedText():
+                    return False
+                self.stop_current_command()
+                return True
+        return super().eventFilter(obj, event)
     
     def on_tab_pressed(self):
         """处理Tab键按下事件"""
@@ -1391,6 +1403,9 @@ class ServerAssistant(QMainWindow):
         self.command_input.setPlaceholderText('输入命令后按回车执行 (Tab键自动补全)')
         self.command_input.returnPressed.connect(self.on_command_input_return)
         
+        # Ctrl+C 快捷键终止命令（仅在命令输入框且未选中文字时）
+        self.command_input.installEventFilter(self)
+        
         # 禁用Tab键切换焦点，用于自动补全
         self.command_input.setFocusPolicy(Qt.ClickFocus)
         
@@ -1442,9 +1457,14 @@ class ServerAssistant(QMainWindow):
         self.button_layout.addWidget(self.upload_button)
         self.button_layout.addWidget(self.download_button)
         self.button_layout.addWidget(self.refresh_output_button)
-        # 右侧按钮：停止命令
+        # 右侧按钮：停止命令（常态化显示）
         self.stop_button_layout = QHBoxLayout()
         self.stop_button_layout.setAlignment(Qt.AlignRight)
+        self.stop_button = QPushButton('停止命令')
+        self.stop_button.setEnabled(False)
+        self.stop_button.setFixedWidth(150)
+        self.stop_button.clicked.connect(self.stop_current_command)
+        self.stop_button_layout.addWidget(self.stop_button)
         # 添加弹簧将停止按钮推到右侧
         self.button_layout.addStretch(1)
         self.button_layout.addLayout(self.stop_button_layout)
@@ -2087,11 +2107,8 @@ class ServerAssistant(QMainWindow):
                 
                 self.current_runnable = runnable
                 
-                if is_continuous:
-                    self.remove_stop_button()
-                    self.stop_button = QPushButton(f'停止命令 ({server_name})')
-                    self.stop_button.clicked.connect(lambda checked, r=runnable: r.stop())
-                    self.stop_button_layout.addWidget(self.stop_button)
+                self.stop_button.setEnabled(True)
+                self.stop_button.setText(f'停止命令 ({server_name})')
                 
                 def on_command_result(result):
                     self.command_log.append(f"  收到命令执行结果")
