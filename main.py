@@ -492,8 +492,8 @@ class DraggableTextEdit(QTextEdit):
         cursor = self.textCursor()
         if cursor.hasSelection():
             text = cursor.selectedText()
-            # 去除末尾空白（包括 Qt 行/段落分隔符）
-            text = text.rstrip(' \t\u2028\u2029')
+            # 去除末尾空白（包括 Qt 行/段落分隔符、回车）
+            text = text.replace('\r', '').rstrip(' \t\u2028\u2029')
             QApplication.clipboard().setText(text)
         else:
             super().copy()
@@ -1286,7 +1286,8 @@ class ServerAssistant(QMainWindow):
         for keyword, color in keywords.items():
             text = patterns[keyword].sub(f'<span style="color: {color}">{keyword}</span>', text)
 
-        text = text.replace('\n', '<br>')
+        # 先去掉 \r 避免解析成尾部空格，再将 \n 转为 <br>
+        text = text.replace('\r', '').replace('\n', '<br>')
         # 去除末尾多余空格，避免复制时带入
         text = text.rstrip(' ')
         return text
