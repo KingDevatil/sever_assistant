@@ -31,6 +31,14 @@ RECV_POLL_INTERVAL = 0.01     # 轮询间隔（秒）
 RECV_SHELL_DELAY = 0.05       # shell 命令发送后等待时间
 RECV_MAX_ATTEMPTS = 5         # 最大读取尝试次数
 
+# 持续运行命令特征（用于自动检测）
+CONTINUOUS_COMMAND_PATTERNS = ['tail -f', 'tailf ', 'watch ', 'top ', 'htop', 'vmstat ', 'iostat ', 'dstat ', 'journalctl -f']
+
+def is_continuous_command(command):
+    """判断命令是否为持续输出命令"""
+    cmd_lower = command.lower().strip()
+    return any(pattern.strip() in cmd_lower for pattern in CONTINUOUS_COMMAND_PATTERNS)
+
 # 布局相关
 BUTTONS_PER_ROW = 6           # 每行按钮数量
 
@@ -363,6 +371,15 @@ class CommandRunnable(QRunnable):
                             break
                         elif not output and (time.time() - start_time) > 1:
                             break
+                    
+                    if not self.is_running:
+                        self.command_log.append(f"  命令执行被用户停止")
+                        try:
+                            self.shell.send('\x03')
+                            time.sleep(0.1)
+                            self.command_log.append(f"  已发送 Ctrl+C 终止命令")
+                        except Exception as e:
+                            self.command_log.append(f"  发送终止信号失败：{e}")
                     
                     self.command_log.append(f"  读取shell输出完成，长度: {len(output)}")
                     
@@ -1791,12 +1808,12 @@ class ServerAssistant(QMainWindow):
         # 清空输入框
         self.command_input.clear()
         
-        # 构造命令信息
+        # 构造命令信息（自动检测持续输出命令）
         command_info = {
             'name': command,
             'command': command,
             'params': [],
-            'continuous': False
+            'continuous': is_continuous_command(command)
         }
         
         # 执行命令
