@@ -37,7 +37,7 @@ CONTINUOUS_COMMAND_PATTERNS = ['tail -f', 'tailf ', 'watch ', 'top ', 'htop', 'v
 def is_continuous_command(command):
     """判断命令是否为持续输出命令"""
     cmd_lower = command.lower().strip()
-    return any(pattern.strip() in cmd_lower for pattern in CONTINUOUS_COMMAND_PATTERNS)
+    return any(cmd_lower.startswith(pattern.strip()) for pattern in CONTINUOUS_COMMAND_PATTERNS)
 
 # 布局相关
 BUTTONS_PER_ROW = 6           # 每行按钮数量
