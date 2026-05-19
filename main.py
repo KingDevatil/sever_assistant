@@ -488,6 +488,16 @@ class DraggableTextEdit(QTextEdit):
             self._base_style = style
         super().setStyleSheet(style)
     
+    def copy(self):
+        cursor = self.textCursor()
+        if cursor.hasSelection():
+            text = cursor.selectedText()
+            # 去除末尾空白（包括 Qt 行/段落分隔符）
+            text = text.rstrip(' \t\u2028\u2029')
+            QApplication.clipboard().setText(text)
+        else:
+            super().copy()
+    
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -1277,6 +1287,8 @@ class ServerAssistant(QMainWindow):
             text = patterns[keyword].sub(f'<span style="color: {color}">{keyword}</span>', text)
 
         text = text.replace('\n', '<br>')
+        # 去除末尾多余空格，避免复制时带入
+        text = text.rstrip(' ')
         return text
     
     def load_settings(self):
