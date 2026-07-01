@@ -30,6 +30,11 @@ RECV_CHUNK_SIZE = 4096        # SSH 接收缓冲区大小
 RECV_POLL_INTERVAL = 0.01     # 轮询间隔（秒）
 RECV_SHELL_DELAY = 0.05       # shell 命令发送后等待时间
 RECV_MAX_ATTEMPTS = 5         # 最大读取尝试次数
+SERVER_OUTPUT_MAX_BLOCKS = 8000
+COMMAND_LOG_MAX_BLOCKS = 3000
+SERVER_OUTPUT_MAX_CHARS = 800000
+SERVER_OUTPUT_TRIM_TO_CHARS = 600000
+PARTIAL_OUTPUT_FLUSH_CHARS = 65536
 
 # 持续运行命令特征（用于自动检测）
 CONTINUOUS_COMMAND_PATTERNS = ['tail -f', 'tailf ', 'watch ', 'top ', 'htop', 'vmstat ', 'iostat ', 'dstat ', 'journalctl -f']
@@ -259,6 +264,7 @@ class CommandSignals(QObject):
     partial_result = pyqtSignal(str)
     finished = pyqtSignal()
     current_dir_updated = pyqtSignal(str, str)
+    log = pyqtSignal(str)
 
 
 class CommandRunnable(QRunnable):
@@ -276,19 +282,28 @@ class CommandRunnable(QRunnable):
         self.saved_dir = current_dirs.get(server_name, "/")
         self.command_timeout = TIMEOUT_COMMAND
         self.is_continuous = is_continuous
+        self.stop_reason = None
     
     def stop(self):
         self.is_running = False
+        self.stop_reason = 'user'
         if self.shell:
             try:
                 self.shell.send('\x03')
             except Exception:
                 pass
+
+    def log_message(self, message):
+        self.signals.log.emit(message)
     
     def recv_with_timeout(self, timeout=0.1):
         start_time = time.time()
         data = ""
         while self.is_running and (time.time() - start_time) < timeout:
+            if not self.is_shell_active():
+                self.stop_reason = 'shell_closed'
+                self.is_running = False
+                break
             if self.shell.recv_ready():
                 try:
                     data += self.shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
@@ -298,22 +313,37 @@ class CommandRunnable(QRunnable):
                     break
             time.sleep(RECV_POLL_INTERVAL)
         return data
-    
+
+    def is_shell_active(self):
+        if not self.shell:
+            return False
+        if getattr(self.shell, 'closed', False):
+            return False
+        if getattr(self.shell, 'eof_received', False):
+            return False
+        try:
+            transport = self.client.get_transport()
+            if transport is not None and not transport.is_active():
+                return False
+        except Exception:
+            pass
+        return True
+
     def run(self):
         try:
-            self.command_log.append(f"  线程开始执行命令: {self.command}")
+            self.log_message(f"  线程开始执行命令: {self.command}")
             
             self.shell = self.server_manager.get_shell(self.server_name)
             
             if self.shell:
-                self.command_log.append(f"  使用持久shell会话执行命令")
+                self.log_message(f"  使用持久shell会话执行命令")
                 
                 current_dir_before = "/"
                 self.shell.send(self.command + '\n')
-                self.command_log.append(f"  命令发送到shell")
+                self.log_message(f"  命令发送到shell")
                 
                 if self.is_continuous:
-                    self.command_log.append(f"  检测到持续运行的命令，开始实时读取输出")
+                    self.log_message(f"  检测到持续运行的命令，开始实时读取输出")
                     output_buffer = ""
                     start_time = time.time()
                     
@@ -327,15 +357,24 @@ class CommandRunnable(QRunnable):
                                 self.signals.partial_result.emit(output_buffer)
                                 output_buffer = ""
                     
+                    if output_buffer:
+                        self.signals.partial_result.emit(output_buffer)
+                        output_buffer = ""
+
                     if not self.is_running:
-                        self.command_log.append(f"  命令执行被用户停止")
+                        if self.stop_reason == 'shell_closed':
+                            self.log_message("  SSH shell 已断开，停止读取持续输出")
+                            self.signals.partial_result.emit("\nSSH shell 已断开，停止读取持续输出\n")
+                            self.signals.finished.emit()
+                            return
+                        self.log_message(f"  命令执行被用户停止")
                         self.signals.partial_result.emit("\n命令已停止\n")
                         try:
                             self.shell.send('\x03')
                             time.sleep(0.1)
-                            self.command_log.append(f"  已发送 Ctrl+C 终止命令")
+                            self.log_message(f"  已发送 Ctrl+C 终止命令")
                         except Exception as e:
-                            self.command_log.append(f"  发送终止信号失败：{e}")
+                            self.log_message(f"  发送终止信号失败：{e}")
                     
                     current_dir = self.saved_dir
                     try:
@@ -351,11 +390,11 @@ class CommandRunnable(QRunnable):
                         found_dir = parse_pwd_output(pwd_output)
                         if found_dir and found_dir != "/":
                             current_dir = found_dir
-                            self.command_log.append(f"  持续命令执行后当前目录: {current_dir}")
+                            self.log_message(f"  持续命令执行后当前目录: {current_dir}")
                         else:
-                            self.command_log.append(f"  使用保存的目录: {current_dir}")
+                            self.log_message(f"  使用保存的目录: {current_dir}")
                     except Exception as e:
-                        self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
+                        self.log_message(f"  获取当前目录失败，使用保存的目录: {e}")
                     
                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                 else:
@@ -373,15 +412,15 @@ class CommandRunnable(QRunnable):
                             break
                     
                     if not self.is_running:
-                        self.command_log.append(f"  命令执行被用户停止")
+                        self.log_message(f"  命令执行被用户停止")
                         try:
                             self.shell.send('\x03')
                             time.sleep(0.1)
-                            self.command_log.append(f"  已发送 Ctrl+C 终止命令")
+                            self.log_message(f"  已发送 Ctrl+C 终止命令")
                         except Exception as e:
-                            self.command_log.append(f"  发送终止信号失败：{e}")
+                            self.log_message(f"  发送终止信号失败：{e}")
                     
-                    self.command_log.append(f"  读取shell输出完成，长度: {len(output)}")
+                    self.log_message(f"  读取shell输出完成，长度: {len(output)}")
                     
                     current_dir = self.saved_dir
                     try:
@@ -397,30 +436,30 @@ class CommandRunnable(QRunnable):
                         found_dir = parse_pwd_output(pwd_output)
                         if found_dir and found_dir != "/":
                             current_dir = found_dir
-                            self.command_log.append(f"  执行后当前目录: {current_dir}")
+                            self.log_message(f"  执行后当前目录: {current_dir}")
                         else:
-                            self.command_log.append(f"  使用保存的目录: {current_dir}")
+                            self.log_message(f"  使用保存的目录: {current_dir}")
                     except Exception as e:
-                        self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
+                        self.log_message(f"  获取当前目录失败，使用保存的目录: {e}")
                     
                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                     
                     # shell 交互会话本身会回显命令，不再手动添加前缀
                     full_output = output
-                    self.command_log.append(f"  构建完整输出完成")
+                    self.log_message(f"  构建完整输出完成")
                     
                     self.signals.result.emit(full_output)
             else:
-                self.command_log.append(f"  没有持久shell会话，使用普通命令执行")
+                self.log_message(f"  没有持久shell会话，使用普通命令执行")
                 try:
                     stdin, stdout, stderr = self.client.exec_command(self.command, timeout=self.command_timeout)
-                    self.command_log.append(f"  命令执行中...")
+                    self.log_message(f"  命令执行中...")
                     
                     output = stdout.read().decode('utf-8', errors='replace') + stderr.read().decode('utf-8', errors='replace')
-                    self.command_log.append(f"  命令执行完成，输出长度: {len(output)}")
+                    self.log_message(f"  命令执行完成，输出长度: {len(output)}")
                 except Exception as e:
                     output = f"命令执行出错: {e}"
-                    self.command_log.append(f"  命令执行出错: {e}")
+                    self.log_message(f"  命令执行出错: {e}")
                 
                 current_dir = self.saved_dir
                 try:
@@ -428,24 +467,24 @@ class CommandRunnable(QRunnable):
                     found_dir = stdout_pwd.read().decode('utf-8', errors='replace').strip()
                     if found_dir and found_dir != "/":
                         current_dir = found_dir
-                        self.command_log.append(f"  当前目录: {current_dir}")
+                        self.log_message(f"  当前目录: {current_dir}")
                     else:
-                        self.command_log.append(f"  使用保存的目录: {current_dir}")
+                        self.log_message(f"  使用保存的目录: {current_dir}")
                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                 except Exception as e:
-                    self.command_log.append(f"  获取当前目录失败，使用保存的目录: {e}")
+                    self.log_message(f"  获取当前目录失败，使用保存的目录: {e}")
                     self.signals.current_dir_updated.emit(self.server_name, current_dir)
                 
                 full_output = f"$ {self.command}\n{output}"
-                self.command_log.append(f"  构建完整输出完成")
+                self.log_message(f"  构建完整输出完成")
                 
                 self.signals.result.emit(full_output)
             
-            self.command_log.append(f"  命令执行完成")
+            self.log_message(f"  命令执行完成")
             self.signals.finished.emit()
         except Exception as e:
             error_msg = f"错误: {e}"
-            self.command_log.append(f"  执行命令时出错: {e}")
+            self.log_message(f"  执行命令时出错: {e}")
             self.signals.result.emit(error_msg)
             self.signals.finished.emit()
 
@@ -1084,6 +1123,12 @@ class ServerAssistant(QMainWindow):
         
         # 输出锁，确保多线程环境下输出顺序正确
         self.output_mutex = QMutex()
+        self.partial_output_buffer = []
+        self.partial_output_buffer_chars = 0
+        self.partial_output_timer = QTimer(self)
+        self.partial_output_timer.setSingleShot(True)
+        self.partial_output_timer.setInterval(100)
+        self.partial_output_timer.timeout.connect(self.flush_partial_output)
         
         # 加载保存的设置
         self.load_settings()
@@ -1131,13 +1176,61 @@ class ServerAssistant(QMainWindow):
                 self.server_output.insertHtml(text)
             else:
                 self.server_output.insertPlainText(text)
+            self.trim_text_edit_chars(self.server_output, SERVER_OUTPUT_MAX_CHARS, SERVER_OUTPUT_TRIM_TO_CHARS)
             self.server_output.ensureCursorVisible()
+
+    def trim_text_edit_chars(self, text_edit, max_chars, trim_to_chars):
+        document = text_edit.document()
+        char_count = document.characterCount()
+        if char_count <= max_chars:
+            return
+        remove_count = max(0, char_count - trim_to_chars)
+        cursor = text_edit.textCursor()
+        old_position = cursor.position()
+        trim_cursor = QTextCursor(document)
+        trim_cursor.setPosition(0)
+        trim_cursor.setPosition(remove_count, QTextCursor.KeepAnchor)
+        trim_cursor.removeSelectedText()
+        cursor.setPosition(max(0, old_position - remove_count))
+        text_edit.setTextCursor(cursor)
+
+    def append_partial_output(self, text):
+        self.partial_output_buffer.append(text)
+        self.partial_output_buffer_chars += len(text)
+        if self.partial_output_buffer_chars >= PARTIAL_OUTPUT_FLUSH_CHARS:
+            self.flush_partial_output()
+            return
+        if not self.partial_output_timer.isActive():
+            self.partial_output_timer.start()
+
+    def flush_partial_output(self):
+        if not self.partial_output_buffer:
+            return
+        text = ''.join(self.partial_output_buffer)
+        self.partial_output_buffer.clear()
+        self.partial_output_buffer_chars = 0
+        self.append_output(self.highlight_keywords(text))
     
     def remove_stop_button(self):
         if hasattr(self, 'stop_button') and self.stop_button:
             self.stop_button.setEnabled(False)
             self.stop_button.setText('停止命令')
         self.current_runnable = None
+
+    def remove_stop_button_for_runnable(self, runnable):
+        if getattr(self, 'current_runnable', None) is runnable:
+            self.remove_stop_button()
+
+    def stop_runnable_for_server(self, server_name):
+        if (
+            hasattr(self, 'current_runnable') and
+            self.current_runnable and
+            getattr(self.current_runnable, 'server_name', None) == server_name and
+            getattr(self.current_runnable, 'is_running', False)
+        ):
+            self.current_runnable.stop()
+            return True
+        return False
     
     def stop_current_command(self):
         if hasattr(self, 'current_runnable') and self.current_runnable and getattr(self.current_runnable, 'is_running', False):
@@ -1236,13 +1329,16 @@ class ServerAssistant(QMainWindow):
     
     def check_connections_status(self):
         disconnected_servers = []
+        stopped_current_runnable = False
         for server_name in list(self.server_manager.connections.keys()):
             if not self.server_manager.is_connection_alive(server_name):
                 disconnected_servers.append(server_name)
+                stopped_current_runnable = self.stop_runnable_for_server(server_name) or stopped_current_runnable
                 self.server_manager.disconnect_server(server_name)
         
         if disconnected_servers:
-            self.remove_stop_button()
+            if stopped_current_runnable:
+                self.remove_stop_button()
             self.refresh_server_list()
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到以下服务器连接已断开: {', '.join(disconnected_servers)}")
             for server_name in disconnected_servers:
@@ -1414,6 +1510,7 @@ class ServerAssistant(QMainWindow):
         self.server_output = DraggableTextEdit()
         self.server_output.setReadOnly(True)
         self.server_output.setText('系统就绪，等待连接...\n\n提示：可将文件拖拽到此区域上传到服务器当前目录')
+        self.server_output.document().setMaximumBlockCount(SERVER_OUTPUT_MAX_BLOCKS)
         self.server_output.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
         self.server_output.setAcceptRichText(True)
         self.server_output.setLineWrapMode(QTextEdit.WidgetWidth)
@@ -1423,6 +1520,7 @@ class ServerAssistant(QMainWindow):
         self.command_log = QTextEdit()
         self.command_log.setReadOnly(True)
         self.command_log.setText('指令执行日志:\n')
+        self.command_log.document().setMaximumBlockCount(COMMAND_LOG_MAX_BLOCKS)
         self.command_log.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d;')
         
         # 添加页签
@@ -1657,6 +1755,7 @@ class ServerAssistant(QMainWindow):
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接服务器时发生错误: {e}")
     
     def disconnect_server(self, server_name):
+        self.stop_runnable_for_server(server_name)
         self.remove_stop_button()
         self.server_manager.disconnect_server(server_name)
         self.refresh_server_list()
@@ -2061,8 +2160,8 @@ class ServerAssistant(QMainWindow):
             return
         
         # 检查是否有持续运行的指令（只对持续输出指令弹窗）
-        is_current_continuous = hasattr(self, 'current_runnable') and self.current_runnable and self.current_runnable.is_running and getattr(self.current_runnable, 'is_continuous', False)
-        if is_current_continuous:
+        is_current_running = hasattr(self, 'current_runnable') and self.current_runnable and self.current_runnable.is_running
+        if is_current_running:
             reply = QMessageBox.question(
                 self,
                 '指令正在运行',
@@ -2142,19 +2241,20 @@ class ServerAssistant(QMainWindow):
                 self.stop_button.setText(f'停止命令 ({server_name})')
                 
                 def on_command_result(result):
+                    self.flush_partial_output()
                     self.command_log.append(f"  收到命令执行结果")
                     highlighted_text = self.highlight_keywords(result)
                     self.append_output(highlighted_text)
                     self.command_log.append("  执行完成")
-                    self.remove_stop_button()
+                    self.remove_stop_button_for_runnable(runnable)
                 
                 def on_partial_result(partial):
-                    highlighted_text = self.highlight_keywords(partial)
-                    self.append_output(highlighted_text)
+                    self.append_partial_output(partial)
                 
                 def on_finished():
+                    self.flush_partial_output()
                     self.command_log.append("  命令执行完成")
-                    self.remove_stop_button()
+                    self.remove_stop_button_for_runnable(runnable)
                 
                 def on_current_dir_updated(server_name, current_dir):
                     self.current_dirs[server_name] = current_dir
@@ -2166,6 +2266,7 @@ class ServerAssistant(QMainWindow):
                 runnable.signals.partial_result.connect(on_partial_result)
                 runnable.signals.finished.connect(on_finished)
                 runnable.signals.current_dir_updated.connect(on_current_dir_updated)
+                runnable.signals.log.connect(self.command_log.append)
                 
                 QThreadPool.globalInstance().start(runnable)
                 self.command_log.append(f"  线程池任务已启动")

@@ -1,4 +1,4 @@
-('C:\\Users\\tanhuapei\\Documents\\trae_projects\\sever_assistant\\build\\服务器后台指令快捷输入工具\\PYZ-00.pyz',
+('D:\\kimicode\\sever_assistant\\build\\服务器后台指令快捷输入工具\\PYZ-00.pyz',
  [('PyQt5',
    'C:\\Users\\tanhuapei\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\PyQt5\\__init__.py',
    'PYMODULE'),
