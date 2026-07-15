@@ -80,7 +80,7 @@ class TestExecuteCommandLinked(unittest.TestCase):
             mock_main.assert_called_once_with('srv1', cmd)
 
     def test_execute_command_with_linked_valid(self):
-        """linked_enabled=True 且关联指令存在时，先执行关联指令，再延迟执行自身"""
+        """主指令的延时必须从前置指令真正完成后开始计算。"""
         linked_cmd = {'name': '前置指令', 'command': 'echo pre'}
         main_cmd = {
             'name': '主指令', 'command': 'echo main',
@@ -96,14 +96,17 @@ class TestExecuteCommandLinked(unittest.TestCase):
             with patch('main.QTimer.singleShot') as mock_timer:
                 self.sa.execute_command('srv1', main_cmd)
 
-                # 关联指令被直接执行（递归调用，from_linked=True）
-                mock_main.assert_any_call('srv1', linked_cmd)
-                # QTimer.singleShot 被调用以延迟执行主指令
+                self.assertEqual(mock_main.call_count, 1)
+                self.assertEqual(mock_main.call_args.args, ('srv1', linked_cmd))
+                completion_callback = mock_main.call_args.kwargs['completion_callback']
+                # 前置指令尚未完成时，不能提前启动延时计时器。
+                mock_timer.assert_not_called()
+
+                completion_callback()
                 mock_timer.assert_called_once_with(500, ANY)
-                # 触发延迟回调，验证主指令被执行
                 callback = mock_timer.call_args[0][1]
                 callback()
-                mock_main.assert_any_call('srv1', main_cmd)
+                mock_main.assert_called_with('srv1', main_cmd)
                 self.assertEqual(mock_main.call_count, 2)
 
     def test_execute_command_linked_not_found(self):

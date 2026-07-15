@@ -3,14 +3,18 @@
 
 import sys
 import re
+import html
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter, QInputDialog, QSpinBox
 from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject, QStringListModel
-from PyQt5.QtGui import QFont, QColor, QTextCursor, QIntValidator, QPixmap, QPainter
+from PyQt5.QtGui import QFont, QFontMetrics, QColor, QTextCursor, QIntValidator, QPixmap, QPainter
 import paramiko
 import json
 import os
 import posixpath
+import stat
+import threading
 import time
+import uuid
 
 
 # ==================== 常量定义 ====================
@@ -30,6 +34,9 @@ RECV_CHUNK_SIZE = 4096        # SSH 接收缓冲区大小
 RECV_POLL_INTERVAL = 0.01     # 轮询间隔（秒）
 RECV_SHELL_DELAY = 0.05       # shell 命令发送后等待时间
 RECV_MAX_ATTEMPTS = 5         # 最大读取尝试次数
+SHELL_HOOK_INSTALL_TIMEOUT = 3.0
+SHELL_PROMPT_TAIL_QUIET = 0.12
+SHELL_STOP_WAIT_TIMEOUT = 5.0
 SERVER_OUTPUT_MAX_BLOCKS = 8000
 COMMAND_LOG_MAX_BLOCKS = 3000
 SERVER_OUTPUT_MAX_CHARS = 800000
@@ -43,6 +50,145 @@ def is_continuous_command(command):
     """判断命令是否为持续输出命令"""
     cmd_lower = command.lower().strip()
     return any(cmd_lower.startswith(pattern.strip()) for pattern in CONTINUOUS_COMMAND_PATTERNS)
+
+
+SHELL_STATUS_OSC_PREFIX = '\x1b]777;SERVER_ASSISTANT;'
+
+
+def build_shell_prompt_hook_command(token):
+    """构建只作用于当前交互 shell 的提示符钩子，不修改远端启动文件。"""
+    safe_token = re.sub(r'[^A-Za-z0-9_-]', '', str(token))
+    if not safe_token:
+        raise ValueError('无效的 shell 状态令牌')
+
+    frame_command = (
+        "printf '\\033]777;SERVER_ASSISTANT;"
+        + safe_token
+        + ";DONE;%s;%s\\007' \"$1\" \"$PWD\""
+    )
+    # Bash 使用 PROMPT_COMMAND，Zsh 使用 precmd；其余 POSIX 风格 shell 退化为
+    # PS1 命令替换。三种方式都保留用户原有提示符，且仅修改当前 SSH 会话。
+    return (
+        "__sa_restore_status(){ return \"$1\"; }; "
+        "__sa_emit_prompt_frame(){ "
+        + frame_command
+        + "; }; "
+        "__sa_prompt_dispatch(){ local __sa_rc=$?; "
+        "__sa_emit_prompt_frame \"$__sa_rc\"; return \"$__sa_rc\"; }; "
+        "if [ -n \"${BASH_VERSION-}\" ]; then "
+        "if declare -p PROMPT_COMMAND 2>/dev/null | command grep -q 'declare -a'; then "
+        "__sa_saved_prompt_kind=array; "
+        "__sa_saved_prompt_commands=(\"${PROMPT_COMMAND[@]}\"); "
+        "else __sa_saved_prompt_kind=string; "
+        "__sa_saved_prompt_command=\"${PROMPT_COMMAND-}\"; fi; "
+        "__sa_prompt_dispatch(){ local __sa_rc=$? __sa_step_rc __sa_cmd; "
+        "if [ \"$__sa_saved_prompt_kind\" = array ]; then "
+        "__sa_step_rc=$__sa_rc; "
+        "for __sa_cmd in \"${__sa_saved_prompt_commands[@]}\"; do "
+        "__sa_restore_status \"$__sa_step_rc\"; "
+        "builtin eval -- \"$__sa_cmd\"; __sa_step_rc=$?; done; "
+        "elif [ -n \"$__sa_saved_prompt_command\" ]; then "
+        "__sa_restore_status \"$__sa_rc\"; "
+        "builtin eval -- \"$__sa_saved_prompt_command\"; fi; "
+        "__sa_emit_prompt_frame \"$__sa_rc\"; return \"$__sa_rc\"; }; "
+        "PROMPT_COMMAND='__sa_prompt_dispatch'; "
+        "if [[ -o history ]]; then "
+        "builtin history -d -1 2>/dev/null || :; fi; "
+        "elif [ -n \"${ZSH_VERSION-}\" ]; then "
+        "__sa_saved_precmd_functions=($precmd_functions); "
+        "__sa_prompt_dispatch(){ local __sa_rc=$? __sa_step_rc=$? __sa_fn; "
+        "for __sa_fn in $__sa_saved_precmd_functions; do "
+        "__sa_restore_status \"$__sa_step_rc\"; \"$__sa_fn\"; "
+        "__sa_step_rc=$?; done; __sa_emit_prompt_frame \"$__sa_rc\"; "
+        "return \"$__sa_rc\"; }; "
+        "precmd_functions=(__sa_prompt_dispatch); "
+        "else PS1='$(__sa_prompt_dispatch)'\"${PS1-\\$ }\"; fi"
+    )
+
+
+class ShellStatusFrameParser:
+    """从 SSH 字节流中移除隐藏状态帧，并返回退出码和完整工作目录。"""
+
+    def __init__(self, token):
+        self.prefix = SHELL_STATUS_OSC_PREFIX + str(token) + ';'
+        self.pending = ''
+        self.text_after_last_frame = None
+
+    def feed(self, text):
+        data = self.pending + (text or '')
+        self.pending = ''
+        visible_parts = []
+        frames = []
+        visible_length_after_last_frame = None
+        position = 0
+
+        while position < len(data):
+            frame_start = data.find(self.prefix, position)
+            if frame_start < 0:
+                tail = data[position:]
+                overlap = self._prefix_overlap(tail)
+                if overlap:
+                    visible_parts.append(tail[:-overlap])
+                    self.pending = tail[-overlap:]
+                else:
+                    visible_parts.append(tail)
+                break
+
+            visible_parts.append(data[position:frame_start])
+            payload_start = frame_start + len(self.prefix)
+            terminator_start, terminator_end = self._find_terminator(data, payload_start)
+            if terminator_start is None:
+                self.pending = data[frame_start:]
+                break
+
+            payload = data[payload_start:terminator_start]
+            frame = self._parse_payload(payload)
+            if frame is not None:
+                frames.append(frame)
+                visible_length_after_last_frame = sum(len(part) for part in visible_parts)
+            position = terminator_end
+
+        visible = ''.join(visible_parts)
+        if visible_length_after_last_frame is None:
+            self.text_after_last_frame = None
+        else:
+            self.text_after_last_frame = visible[visible_length_after_last_frame:]
+        return visible, frames
+
+    def discard_pending(self):
+        self.pending = ''
+
+    def _prefix_overlap(self, text):
+        max_length = min(len(text), len(self.prefix) - 1)
+        for length in range(max_length, 0, -1):
+            if text.endswith(self.prefix[:length]):
+                return length
+        return 0
+
+    @staticmethod
+    def _find_terminator(data, start):
+        bell_position = data.find('\x07', start)
+        string_terminator_position = data.find('\x1b\\', start)
+        candidates = []
+        if bell_position >= 0:
+            candidates.append((bell_position, bell_position + 1))
+        if string_terminator_position >= 0:
+            candidates.append((string_terminator_position, string_terminator_position + 2))
+        if not candidates:
+            return None, None
+        return min(candidates, key=lambda candidate: candidate[0])
+
+    @staticmethod
+    def _parse_payload(payload):
+        parts = payload.split(';', 2)
+        if len(parts) != 3:
+            return None
+        kind, status_text, cwd = parts
+        try:
+            exit_status = int(status_text)
+        except (TypeError, ValueError):
+            return None
+        return {'kind': kind, 'exit_status': exit_status, 'cwd': cwd}
 
 # 布局相关
 BUTTONS_PER_ROW = 6           # 每行按钮数量
@@ -259,6 +405,311 @@ def parse_pwd_output(pwd_output):
     return "/"
 
 
+class TerminalOutputFormatter:
+    """将终端 ANSI 控制序列转换为适合 QTextEdit 的安全 HTML。"""
+
+    _BASIC_COLORS = (
+        '#000000', '#cd3131', '#0dbc79', '#e5e510',
+        '#2472c8', '#bc3fbc', '#11a8cd', '#e5e5e5',
+    )
+    _BRIGHT_COLORS = (
+        '#666666', '#f14c4c', '#23d18b', '#f5f543',
+        '#3b8eea', '#d670d6', '#29b8db', '#ffffff',
+    )
+    _DEFAULT_FOREGROUND = '#ffffff'
+    _DEFAULT_BACKGROUND = '#1e1e1e'
+
+    def __init__(self, text_renderer=None):
+        self.text_renderer = text_renderer or self._default_text_renderer
+        self.reset()
+
+    @staticmethod
+    def _default_text_renderer(text):
+        return html.escape(text).replace('\r', '').replace('\n', '<br>')
+
+    def reset(self):
+        """丢弃未完成的控制序列，并恢复默认终端样式。"""
+        self.pending_sequence = ''
+        self._reset_style()
+
+    def _reset_style(self):
+        self.foreground = None
+        self.background = None
+        self.bold = False
+        self.faint = False
+        self.italic = False
+        self.underline = False
+        self.inverse = False
+        self.conceal = False
+        self.strike = False
+
+    def feed(self, text):
+        """解析一段输出；未完整接收的 ANSI 序列会留到下一段继续解析。"""
+        if not text and not self.pending_sequence:
+            return ''
+
+        data = self.pending_sequence + text
+        self.pending_sequence = ''
+        result = []
+        position = 0
+
+        while position < len(data):
+            escape_position = data.find('\x1b', position)
+            if escape_position < 0:
+                result.append(self._render_text(data[position:]))
+                break
+
+            result.append(self._render_text(data[position:escape_position]))
+
+            if escape_position + 1 >= len(data):
+                self.pending_sequence = data[escape_position:]
+                break
+
+            introducer = data[escape_position + 1]
+            if introducer == '[':
+                sequence_end = self._find_csi_end(data, escape_position + 2)
+                if sequence_end is None:
+                    self.pending_sequence = data[escape_position:]
+                    break
+                if data[sequence_end] == 'm':
+                    self._apply_sgr(data[escape_position + 2:sequence_end])
+                position = sequence_end + 1
+                continue
+
+            if introducer == ']':
+                sequence_end = self._find_osc_end(data, escape_position + 2)
+                if sequence_end is None:
+                    self.pending_sequence = data[escape_position:]
+                    break
+                position = sequence_end
+                continue
+
+            # 字符集选择等 ESC 序列由三个字符组成，其余常见 ESC 序列为两个字符。
+            if introducer in '()*+-./':
+                if escape_position + 2 >= len(data):
+                    self.pending_sequence = data[escape_position:]
+                    break
+                position = escape_position + 3
+            else:
+                position = escape_position + 2
+
+        rendered = ''.join(result)
+        # 未完整的 ANSI 序列后面还会继续输出，此时片段末尾空格可能是下一列的间隔。
+        if self.pending_sequence:
+            return rendered
+        if re.search(r'[$#%>\]] +$', data):
+            return rendered.rstrip(' ') + ' '
+        return rendered.rstrip(' ')
+
+    @staticmethod
+    def _find_csi_end(data, start):
+        for index in range(start, len(data)):
+            if 0x40 <= ord(data[index]) <= 0x7e:
+                return index
+        return None
+
+    @staticmethod
+    def _find_osc_end(data, start):
+        bell_position = data.find('\x07', start)
+        string_terminator_position = data.find('\x1b\\', start)
+
+        candidates = []
+        if bell_position >= 0:
+            candidates.append((bell_position, bell_position + 1))
+        if string_terminator_position >= 0:
+            candidates.append((string_terminator_position, string_terminator_position + 2))
+        if not candidates:
+            return None
+        return min(candidates, key=lambda candidate: candidate[0])[1]
+
+    def _render_text(self, text):
+        if not text:
+            return ''
+        # ANSI 前景色由服务端明确指定时，不再让本地关键词颜色覆盖它。
+        if self.foreground is not None or self.inverse or self.conceal:
+            rendered = self._default_text_renderer(text)
+        else:
+            rendered = self.text_renderer(text)
+        css = self._current_css()
+        if not css:
+            return rendered
+        return f'<span style="{css}">{rendered}</span>'
+
+    def _current_css(self):
+        foreground = self.foreground
+        background = self.background
+        if self.inverse:
+            foreground, background = (
+                background or self._DEFAULT_BACKGROUND,
+                foreground or self._DEFAULT_FOREGROUND,
+            )
+
+        styles = []
+        if foreground:
+            styles.append(f'color: {foreground}')
+        if background:
+            styles.append(f'background-color: {background}')
+        if self.bold:
+            styles.append('font-weight: bold')
+        if self.faint:
+            styles.append('opacity: 0.7')
+        if self.italic:
+            styles.append('font-style: italic')
+
+        decorations = []
+        if self.underline:
+            decorations.append('underline')
+        if self.strike:
+            decorations.append('line-through')
+        if decorations:
+            styles.append(f'text-decoration: {" ".join(decorations)}')
+        if self.conceal:
+            styles.append('color: transparent')
+        return '; '.join(styles)
+
+    def _apply_sgr(self, parameter_text):
+        if not parameter_text:
+            parameters = [0]
+        else:
+            try:
+                parameters = [int(value) if value else 0 for value in parameter_text.split(';')]
+            except ValueError:
+                return
+
+        index = 0
+        while index < len(parameters):
+            code = parameters[index]
+            if code == 0:
+                self._reset_style()
+            elif code == 1:
+                self.bold = True
+            elif code == 2:
+                self.faint = True
+            elif code == 3:
+                self.italic = True
+            elif code == 4:
+                self.underline = True
+            elif code == 7:
+                self.inverse = True
+            elif code == 8:
+                self.conceal = True
+            elif code == 9:
+                self.strike = True
+            elif code in (21, 22):
+                self.bold = False
+                self.faint = False
+            elif code == 23:
+                self.italic = False
+            elif code == 24:
+                self.underline = False
+            elif code == 27:
+                self.inverse = False
+            elif code == 28:
+                self.conceal = False
+            elif code == 29:
+                self.strike = False
+            elif 30 <= code <= 37:
+                self.foreground = self._BASIC_COLORS[code - 30]
+            elif code == 39:
+                self.foreground = None
+            elif 40 <= code <= 47:
+                self.background = self._BASIC_COLORS[code - 40]
+            elif code == 49:
+                self.background = None
+            elif 90 <= code <= 97:
+                self.foreground = self._BRIGHT_COLORS[code - 90]
+            elif 100 <= code <= 107:
+                self.background = self._BRIGHT_COLORS[code - 100]
+            elif code in (38, 48):
+                color, consumed = self._parse_extended_color(parameters, index + 1)
+                if color:
+                    if code == 38:
+                        self.foreground = color
+                    else:
+                        self.background = color
+                index += consumed
+            index += 1
+
+    def _parse_extended_color(self, parameters, start):
+        if start >= len(parameters):
+            return None, 0
+
+        mode = parameters[start]
+        if mode == 5 and start + 1 < len(parameters):
+            color_index = parameters[start + 1]
+            if 0 <= color_index <= 255:
+                return self._xterm_color(color_index), 2
+            return None, 2
+
+        if mode == 2 and start + 3 < len(parameters):
+            red, green, blue = parameters[start + 1:start + 4]
+            if all(0 <= component <= 255 for component in (red, green, blue)):
+                return f'#{red:02x}{green:02x}{blue:02x}', 4
+            return None, 4
+
+        return None, 1
+
+    @classmethod
+    def _xterm_color(cls, color_index):
+        if color_index < 8:
+            return cls._BASIC_COLORS[color_index]
+        if color_index < 16:
+            return cls._BRIGHT_COLORS[color_index - 8]
+        if color_index < 232:
+            color_index -= 16
+            levels = (0, 95, 135, 175, 215, 255)
+            red = levels[color_index // 36]
+            green = levels[(color_index % 36) // 6]
+            blue = levels[color_index % 6]
+            return f'#{red:02x}{green:02x}{blue:02x}'
+        level = 8 + (color_index - 232) * 10
+        return f'#{level:02x}{level:02x}{level:02x}'
+
+
+class FileListSignals(QObject):
+    result = pyqtSignal(str, str, object)
+    finished = pyqtSignal()
+
+
+class FileListRunnable(QRunnable):
+    """通过独立 SFTP 通道异步读取目录，避免 GUI 线程等待远端 ls。"""
+
+    def __init__(self, client, server_name, current_dir):
+        super().__init__()
+        self.client = client
+        self.server_name = server_name
+        self.current_dir = current_dir
+        self.signals = FileListSignals()
+
+    def run(self):
+        sftp = None
+        try:
+            sftp = self.client.open_sftp()
+            files = []
+            for entry in sftp.listdir_attr(self.current_dir):
+                filename = entry.filename
+                if filename in ('.', '..'):
+                    continue
+                if stat.S_ISDIR(entry.st_mode):
+                    filename += '/'
+                files.append(filename)
+            self.signals.result.emit(
+                self.server_name,
+                self.current_dir,
+                files,
+            )
+        except Exception:
+            # 文件补全是辅助能力，失败不应污染命令输出。
+            pass
+        finally:
+            if sftp is not None:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            self.signals.finished.emit()
+
+
 class CommandSignals(QObject):
     result = pyqtSignal(str)
     partial_result = pyqtSignal(str)
@@ -283,23 +734,42 @@ class CommandRunnable(QRunnable):
         self.command_timeout = TIMEOUT_COMMAND
         self.is_continuous = is_continuous
         self.stop_reason = None
+        self.stop_requested = False
+        self.stop_requested_at = None
+        self.interrupt_sent = False
+        self.command_sent = False
+        self._state_lock = threading.Lock()
+        self.exit_status = None
+        self._shell_lock = None
+        self._shell_lock_acquired = False
     
     def stop(self):
-        self.is_running = False
-        self.stop_reason = 'user'
-        if self.shell:
-            try:
-                self.shell.send('\x03')
-            except Exception:
-                pass
+        with self._state_lock:
+            if self.stop_requested:
+                return
+            self.stop_requested = True
+            self.stop_requested_at = time.monotonic()
+            self.stop_reason = 'user'
+        self._send_interrupt_once()
+
+    def _send_interrupt_once(self):
+        with self._state_lock:
+            if self.interrupt_sent or not self.shell or not self.command_sent:
+                return
+            self.interrupt_sent = True
+        try:
+            self.shell.send('\x03')
+            self.log_message("  已发送 Ctrl+C 终止命令")
+        except Exception as error:
+            self.log_message(f"  发送终止信号失败：{error}")
 
     def log_message(self, message):
         self.signals.log.emit(message)
     
     def recv_with_timeout(self, timeout=0.1):
-        start_time = time.time()
+        start_time = time.monotonic()
         data = ""
-        while self.is_running and (time.time() - start_time) < timeout:
+        while self.is_running and (time.monotonic() - start_time) < timeout:
             if not self.is_shell_active():
                 self.stop_reason = 'shell_closed'
                 self.is_running = False
@@ -329,163 +799,224 @@ class CommandRunnable(QRunnable):
             pass
         return True
 
+    def _acquire_shell_lock(self):
+        get_lock = getattr(self.server_manager, 'get_shell_lock', None)
+        if not callable(get_lock):
+            return True
+        lock = get_lock(self.server_name)
+        if lock is None:
+            return True
+        self._shell_lock = lock
+        while self.is_running:
+            if self.stop_requested:
+                return False
+            try:
+                acquired = lock.acquire(timeout=0.1)
+            except TypeError:
+                acquired = lock.acquire(False)
+                if not acquired:
+                    time.sleep(RECV_POLL_INTERVAL)
+            if acquired:
+                self._shell_lock_acquired = True
+                return True
+        return False
+
+    def _release_shell_lock(self):
+        if self._shell_lock is not None and self._shell_lock_acquired:
+            try:
+                self._shell_lock.release()
+            except Exception:
+                pass
+        self._shell_lock_acquired = False
+
+    def _publish_visible_output(self, text, output_parts):
+        if not text:
+            return
+        if self.is_continuous:
+            self.signals.partial_result.emit(text)
+        else:
+            output_parts.append(text)
+
+    def _update_current_directory(self, current_dir):
+        current_dir = current_dir or self.saved_dir
+        set_current_dir = getattr(self.server_manager, 'set_shell_current_dir', None)
+        if callable(set_current_dir):
+            try:
+                set_current_dir(self.server_name, current_dir)
+            except Exception:
+                pass
+        self.signals.current_dir_updated.emit(self.server_name, current_dir)
+
+    def _run_prompt_aware_shell(self, token):
+        parser = ShellStatusFrameParser(token)
+        output_parts = []
+        completion_frame = None
+        last_prompt_data_at = None
+        prompt_tail_parts = []
+
+        with self._state_lock:
+            if self.stop_requested:
+                return
+            self.shell.send(self.command + '\n')
+            self.command_sent = True
+        self.log_message("  命令已发送，等待远端提示符状态帧")
+
+        while self.is_running:
+            chunk = self.recv_with_timeout(0.05)
+            now = time.monotonic()
+            if chunk:
+                visible, frames = parser.feed(chunk)
+                self._publish_visible_output(visible, output_parts)
+                if frames:
+                    completion_frame = frames[-1]
+                    self.exit_status = completion_frame['exit_status']
+                    last_prompt_data_at = now
+                    prompt_tail_parts = [parser.text_after_last_frame or '']
+                    with self._state_lock:
+                        self.command_sent = False
+                elif completion_frame is not None:
+                    last_prompt_data_at = now
+                    prompt_tail_parts.append(visible)
+
+            if completion_frame is not None:
+                if not chunk and now - last_prompt_data_at >= SHELL_PROMPT_TAIL_QUIET:
+                    break
+                continue
+
+            if self.stop_requested:
+                self._send_interrupt_once()
+                if self.stop_requested_at and now - self.stop_requested_at >= SHELL_STOP_WAIT_TIMEOUT:
+                    self.log_message("  等待远端提示符超时，结束本次读取")
+                    break
+                continue
+
+        parser.discard_pending()
+        if completion_frame is not None:
+            current_dir = completion_frame.get('cwd') or self.saved_dir
+            prompt_tail = ''.join(prompt_tail_parts)
+            set_prompt = getattr(self.server_manager, 'set_shell_prompt', None)
+            if prompt_tail and callable(set_prompt):
+                set_prompt(self.server_name, prompt_tail)
+            self.log_message(
+                f"  命令完成，退出码: {self.exit_status}，当前目录: {current_dir}"
+            )
+        else:
+            current_dir = self.saved_dir
+            self.log_message(f"  未收到完整状态帧，保留当前目录: {current_dir}")
+            disconnect = getattr(self.server_manager, 'disconnect_server', None)
+            if callable(disconnect):
+                try:
+                    disconnect(self.server_name)
+                    self.log_message("  已丢弃状态不确定的 SSH 会话，下次指令将自动重连")
+                except Exception:
+                    pass
+
+        self._update_current_directory(current_dir)
+        if not self.is_continuous:
+            self.signals.result.emit(''.join(output_parts))
+
+    def _read_legacy_until_idle(self, idle_timeout, total_timeout):
+        output = []
+        started_at = time.monotonic()
+        last_data_at = started_at
+        received_any = False
+        while self.is_running and time.monotonic() - started_at < total_timeout:
+            chunk = self.recv_with_timeout(0.05)
+            now = time.monotonic()
+            if chunk:
+                output.append(chunk)
+                received_any = True
+                last_data_at = now
+            elif received_any and now - last_data_at >= idle_timeout:
+                break
+            elif self.stop_requested and self.stop_requested_at and now - self.stop_requested_at >= SHELL_STOP_WAIT_TIMEOUT:
+                break
+        return ''.join(output)
+
+    def _run_legacy_shell(self):
+        """极少数无法安装提示符钩子的 shell 保留兼容路径。"""
+        self.log_message("  远端 shell 不支持提示符状态钩子，使用兼容读取模式")
+        with self._state_lock:
+            if self.stop_requested:
+                return
+            self.shell.send(self.command + '\n')
+            self.command_sent = True
+
+        if self.is_continuous:
+            while self.is_running and not self.stop_requested:
+                chunk = self.recv_with_timeout(0.1)
+                if chunk:
+                    self.signals.partial_result.emit(chunk)
+            self._send_interrupt_once()
+            tail = self._read_legacy_until_idle(0.5, SHELL_STOP_WAIT_TIMEOUT)
+            if tail:
+                self.signals.partial_result.emit(tail)
+        else:
+            output = self._read_legacy_until_idle(0.5, self.command_timeout)
+            if self.stop_requested:
+                self._send_interrupt_once()
+                output += self._read_legacy_until_idle(0.5, SHELL_STOP_WAIT_TIMEOUT)
+            self.signals.result.emit(output)
+
+        # 兼容模式仍需查询交互 shell 的目录，但会等待整个提示符稳定后再释放锁，
+        # 避免旧版只读到 pwd 回显就把真实路径遗留给下一条命令。
+        current_dir = self.saved_dir
+        if self.is_shell_active():
+            try:
+                self.shell.send('pwd\n')
+                pwd_output = self._read_legacy_until_idle(0.25, TIMEOUT_EXEC_MEDIUM)
+                found_dir = parse_pwd_output(pwd_output)
+                if found_dir and found_dir != '/':
+                    current_dir = found_dir
+            except Exception as error:
+                self.log_message(f"  兼容模式获取当前目录失败: {error}")
+        self._update_current_directory(current_dir)
+
+    def _run_exec_command(self):
+        self.log_message("  没有持久 shell 会话，使用普通命令执行")
+        try:
+            stdin, stdout, stderr = self.client.exec_command(
+                self.command, timeout=self.command_timeout
+            )
+            output = (
+                stdout.read().decode('utf-8', errors='replace')
+                + stderr.read().decode('utf-8', errors='replace')
+            )
+        except Exception as error:
+            output = f"命令执行出错: {error}"
+        self._update_current_directory(self.saved_dir)
+        self.signals.result.emit(f"$ {self.command}\n{output}")
+
     def run(self):
         try:
             self.log_message(f"  线程开始执行命令: {self.command}")
-            
-            self.shell = self.server_manager.get_shell(self.server_name)
-            
-            if self.shell:
-                self.log_message(f"  使用持久shell会话执行命令")
-                
-                current_dir_before = "/"
-                self.shell.send(self.command + '\n')
-                self.log_message(f"  命令发送到shell")
-                
-                if self.is_continuous:
-                    self.log_message(f"  检测到持续运行的命令，开始实时读取输出")
-                    output_buffer = ""
-                    start_time = time.time()
-                    
-                    # 不再手动发送命令前缀，shell 交互会话本身会回显命令
-                    
-                    while self.is_running:
-                        output = self.recv_with_timeout(0.1)
-                        if output:
-                            output_buffer += output
-                            if '\n' in output_buffer:
-                                self.signals.partial_result.emit(output_buffer)
-                                output_buffer = ""
-                    
-                    if output_buffer:
-                        self.signals.partial_result.emit(output_buffer)
-                        output_buffer = ""
-
-                    if not self.is_running:
-                        if self.stop_reason == 'shell_closed':
-                            self.log_message("  SSH shell 已断开，停止读取持续输出")
-                            self.signals.partial_result.emit("\nSSH shell 已断开，停止读取持续输出\n")
-                            self.signals.finished.emit()
-                            return
-                        self.log_message(f"  命令执行被用户停止")
-                        self.signals.partial_result.emit("\n命令已停止\n")
-                        try:
-                            self.shell.send('\x03')
-                            time.sleep(0.1)
-                            self.log_message(f"  已发送 Ctrl+C 终止命令")
-                        except Exception as e:
-                            self.log_message(f"  发送终止信号失败：{e}")
-                    
-                    current_dir = self.saved_dir
-                    try:
-                        self.shell.send('pwd\n')
-                        pwd_output = ""
-                        for _ in range(20):
-                            time.sleep(RECV_SHELL_DELAY)
-                            if self.shell.recv_ready():
-                                pwd_output += self.shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
-                                if '\n' in pwd_output:
-                                    break
-
-                        found_dir = parse_pwd_output(pwd_output)
-                        if found_dir and found_dir != "/":
-                            current_dir = found_dir
-                            self.log_message(f"  持续命令执行后当前目录: {current_dir}")
-                        else:
-                            self.log_message(f"  使用保存的目录: {current_dir}")
-                    except Exception as e:
-                        self.log_message(f"  获取当前目录失败，使用保存的目录: {e}")
-                    
-                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
+            shell = self.server_manager.get_shell(self.server_name)
+            if shell:
+                if not self._acquire_shell_lock():
+                    self.log_message("  命令在等待 shell 时已取消")
+                    return
+                self.shell = shell
+                if self.stop_requested:
+                    self.log_message("  命令在发送前已取消")
+                    return
+                get_token = getattr(self.server_manager, 'get_shell_status_token', None)
+                token = get_token(self.server_name) if callable(get_token) else None
+                if isinstance(token, str) and token:
+                    self._run_prompt_aware_shell(token)
                 else:
-                    output = ""
-                    start_time = time.time()
-                    
-                    while self.is_running and (time.time() - start_time) < self.command_timeout:
-                        output_chunk = self.recv_with_timeout(0.1)
-                        if output_chunk:
-                            output += output_chunk
-                            start_time = time.time()
-                        elif output and (time.time() - start_time) > 0.5:
-                            break
-                        elif not output and (time.time() - start_time) > 1:
-                            break
-                    
-                    if not self.is_running:
-                        self.log_message(f"  命令执行被用户停止")
-                        try:
-                            self.shell.send('\x03')
-                            time.sleep(0.1)
-                            self.log_message(f"  已发送 Ctrl+C 终止命令")
-                        except Exception as e:
-                            self.log_message(f"  发送终止信号失败：{e}")
-                    
-                    self.log_message(f"  读取shell输出完成，长度: {len(output)}")
-                    
-                    current_dir = self.saved_dir
-                    try:
-                        self.shell.send('pwd\n')
-                        pwd_output = ""
-                        for _ in range(20):
-                            time.sleep(RECV_SHELL_DELAY)
-                            if self.shell.recv_ready():
-                                pwd_output += self.shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
-                                if '\n' in pwd_output:
-                                    break
-
-                        found_dir = parse_pwd_output(pwd_output)
-                        if found_dir and found_dir != "/":
-                            current_dir = found_dir
-                            self.log_message(f"  执行后当前目录: {current_dir}")
-                        else:
-                            self.log_message(f"  使用保存的目录: {current_dir}")
-                    except Exception as e:
-                        self.log_message(f"  获取当前目录失败，使用保存的目录: {e}")
-                    
-                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
-                    
-                    # shell 交互会话本身会回显命令，不再手动添加前缀
-                    full_output = output
-                    self.log_message(f"  构建完整输出完成")
-                    
-                    self.signals.result.emit(full_output)
+                    self._run_legacy_shell()
             else:
-                self.log_message(f"  没有持久shell会话，使用普通命令执行")
-                try:
-                    stdin, stdout, stderr = self.client.exec_command(self.command, timeout=self.command_timeout)
-                    self.log_message(f"  命令执行中...")
-                    
-                    output = stdout.read().decode('utf-8', errors='replace') + stderr.read().decode('utf-8', errors='replace')
-                    self.log_message(f"  命令执行完成，输出长度: {len(output)}")
-                except Exception as e:
-                    output = f"命令执行出错: {e}"
-                    self.log_message(f"  命令执行出错: {e}")
-                
-                current_dir = self.saved_dir
-                try:
-                    stdin_pwd, stdout_pwd, stderr_pwd = self.client.exec_command('pwd', timeout=TIMEOUT_EXEC_MEDIUM)
-                    found_dir = stdout_pwd.read().decode('utf-8', errors='replace').strip()
-                    if found_dir and found_dir != "/":
-                        current_dir = found_dir
-                        self.log_message(f"  当前目录: {current_dir}")
-                    else:
-                        self.log_message(f"  使用保存的目录: {current_dir}")
-                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
-                except Exception as e:
-                    self.log_message(f"  获取当前目录失败，使用保存的目录: {e}")
-                    self.signals.current_dir_updated.emit(self.server_name, current_dir)
-                
-                full_output = f"$ {self.command}\n{output}"
-                self.log_message(f"  构建完整输出完成")
-                
-                self.signals.result.emit(full_output)
-            
-            self.log_message(f"  命令执行完成")
-            self.signals.finished.emit()
-        except Exception as e:
-            error_msg = f"错误: {e}"
-            self.log_message(f"  执行命令时出错: {e}")
+                self._run_exec_command()
+        except Exception as error:
+            error_msg = f"错误: {error}"
+            self.log_message(f"  执行命令时出错: {error}")
             self.signals.result.emit(error_msg)
+        finally:
+            self._release_shell_lock()
+            with self._state_lock:
+                self.command_sent = False
+            self.is_running = False
+            self.log_message("  命令执行完成")
             self.signals.finished.emit()
 
 
@@ -580,6 +1111,10 @@ class ServerManager:
         self.servers = []
         self.connections = {}
         self.shells = {}  # 存储持久的shell会话
+        self.shell_locks = {}
+        self.shell_status_tokens = {}
+        self.shell_current_dirs = {}
+        self.shell_prompts = {}
         self.base_dir = get_base_dir()
         self.load_servers()
     
@@ -611,9 +1146,17 @@ class ServerManager:
             old_name = self.servers[index]['name']
             self.servers[index] = server_info
             if old_name != server_info['name']:
-                if old_name in self.connections:
-                    conn = self.connections.pop(old_name)
-                    self.connections[server_info['name']] = conn
+                new_name = server_info['name']
+                for mapping in (
+                    self.connections,
+                    self.shells,
+                    self.shell_locks,
+                    self.shell_status_tokens,
+                    self.shell_current_dirs,
+                    self.shell_prompts,
+                ):
+                    if old_name in mapping:
+                        mapping[new_name] = mapping.pop(old_name)
             self.save_servers()
     
     def copy_server(self, index):
@@ -650,6 +1193,20 @@ class ServerManager:
                     try:
                         shell = client.invoke_shell()
                         self.shells[server_name] = shell
+                        self.shell_locks[server_name] = threading.Lock()
+                        token = uuid.uuid4().hex
+                        status_frame, prompt_tail = self._install_shell_prompt_hook(
+                            shell, token
+                        )
+                        if status_frame is not None:
+                            self.shell_status_tokens[server_name] = token
+                            current_dir = status_frame.get('cwd')
+                            if current_dir:
+                                self.shell_current_dirs[server_name] = current_dir
+                            if prompt_tail:
+                                self.shell_prompts[server_name] = prompt_tail
+                        else:
+                            print('远端 shell 未确认提示符状态钩子，将使用兼容模式')
                     except Exception as shell_error:
                         # shell 创建失败，保留 exec 连接但记录错误
                         print(f"创建 shell 会话失败: {shell_error}")
@@ -658,23 +1215,101 @@ class ServerManager:
                     print(f"连接失败: {e}")
                     return False
         return False
+
+    @staticmethod
+    def _drain_shell_until_quiet(shell, max_wait=0.5, quiet_time=0.1):
+        started_at = time.monotonic()
+        last_data_at = None
+        while time.monotonic() - started_at < max_wait:
+            if shell.recv_ready():
+                shell.recv(RECV_CHUNK_SIZE)
+                last_data_at = time.monotonic()
+                continue
+            now = time.monotonic()
+            if last_data_at is not None and now - last_data_at >= quiet_time:
+                break
+            if last_data_at is None and now - started_at >= min(0.25, max_wait):
+                break
+            time.sleep(RECV_POLL_INTERVAL)
+
+    def _install_shell_prompt_hook(self, shell, token):
+        """安装会话级提示符钩子，并吞掉安装命令自身的回显。"""
+        self._drain_shell_until_quiet(shell)
+        parser = ShellStatusFrameParser(token)
+        shell.send(build_shell_prompt_hook_command(token) + '\n')
+        started_at = time.monotonic()
+        completion_frame = None
+        last_data_at = None
+        prompt_tail_parts = []
+
+        while time.monotonic() - started_at < SHELL_HOOK_INSTALL_TIMEOUT:
+            if getattr(shell, 'closed', False) or getattr(shell, 'eof_received', False):
+                break
+            if shell.recv_ready():
+                chunk = shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
+                visible, frames = parser.feed(chunk)
+                last_data_at = time.monotonic()
+                if frames:
+                    completion_frame = frames[-1]
+                    prompt_tail_parts = [parser.text_after_last_frame or '']
+                elif completion_frame is not None:
+                    prompt_tail_parts.append(visible)
+                continue
+
+            now = time.monotonic()
+            if (
+                completion_frame is not None
+                and last_data_at is not None
+                and now - last_data_at >= SHELL_PROMPT_TAIL_QUIET
+            ):
+                break
+            time.sleep(RECV_POLL_INTERVAL)
+
+        parser.discard_pending()
+        if completion_frame is None:
+            self._drain_shell_until_quiet(shell, max_wait=0.5, quiet_time=0.15)
+        return completion_frame, ''.join(prompt_tail_parts)
     
     def disconnect_server(self, server_name):
         if server_name in self.connections:
             try:
                 self.connections[server_name].close()
-                del self.connections[server_name]
             except Exception:
                 pass
+            self.connections.pop(server_name, None)
         if server_name in self.shells:
             try:
                 self.shells[server_name].close()
-                del self.shells[server_name]
             except Exception:
                 pass
+            self.shells.pop(server_name, None)
+        self.shell_locks.pop(server_name, None)
+        self.shell_status_tokens.pop(server_name, None)
+        self.shell_current_dirs.pop(server_name, None)
+        self.shell_prompts.pop(server_name, None)
     
     def get_shell(self, server_name):
         return self.shells.get(server_name)
+
+    def get_shell_lock(self, server_name):
+        return self.shell_locks.get(server_name)
+
+    def get_shell_status_token(self, server_name):
+        return self.shell_status_tokens.get(server_name)
+
+    def get_shell_current_dir(self, server_name):
+        return self.shell_current_dirs.get(server_name)
+
+    def set_shell_current_dir(self, server_name, current_dir):
+        if current_dir:
+            self.shell_current_dirs[server_name] = current_dir
+
+    def get_shell_prompt(self, server_name):
+        return self.shell_prompts.get(server_name)
+
+    def set_shell_prompt(self, server_name, prompt):
+        if prompt:
+            self.shell_prompts[server_name] = prompt
     
     def is_connected(self, server_name):
         return server_name in self.connections
@@ -1102,6 +1737,8 @@ class ServerAssistant(QMainWindow):
         self.server_button_layouts = {}  # 存储每个服务器页签的按钮布局
         self.test_mode = False  # 取消测试模式，始终使用实际服务器连接
         self.current_dirs = {}  # 存储每个服务器的当前目录
+        self._file_list_runnables = set()
+        self.output_shell_server = None
         self.settings_file = os.path.join(self.server_manager.base_dir, 'settings.json')
         
         # 布局参数默认值
@@ -1129,6 +1766,7 @@ class ServerAssistant(QMainWindow):
         self.partial_output_timer.setSingleShot(True)
         self.partial_output_timer.setInterval(100)
         self.partial_output_timer.timeout.connect(self.flush_partial_output)
+        self.terminal_output_formatter = TerminalOutputFormatter(self._highlight_plain_text)
         
         # 加载保存的设置
         self.load_settings()
@@ -1173,11 +1811,28 @@ class ServerAssistant(QMainWindow):
             cursor.movePosition(QTextCursor.End)
             self.server_output.setTextCursor(cursor)
             if is_html:
-                self.server_output.insertHtml(text)
+                # QTextEdit 按 HTML 规则会折叠连续空格；pre-wrap 保留终端列宽并允许长行换行。
+                self.server_output.insertHtml(
+                    f'<span style="white-space: pre-wrap">{text}</span>'
+                )
             else:
                 self.server_output.insertPlainText(text)
             self.trim_text_edit_chars(self.server_output, SERVER_OUTPUT_MAX_CHARS, SERVER_OUTPUT_TRIM_TO_CHARS)
             self.server_output.ensureCursorVisible()
+
+    def prepare_output_shell_context(self, server_name):
+        """目标服务器改变时补回其原生提示符，随后仍可恢复原服务器输出。"""
+        instance_state = object.__getattribute__(self, '__dict__')
+        if instance_state.get('output_shell_server') == server_name:
+            return
+
+        prompt = self.server_manager.get_shell_prompt(server_name)
+        if isinstance(prompt, str) and prompt:
+            existing_text = self.server_output.toPlainText()
+            separator = '' if not existing_text or existing_text.endswith('\n') else '\n'
+            self.reset_terminal_output_formatter()
+            self.append_output(self.highlight_keywords(separator + prompt))
+        instance_state['output_shell_server'] = server_name
 
     def trim_text_edit_chars(self, text_edit, max_chars, trim_to_chars):
         document = text_edit.document()
@@ -1236,6 +1891,10 @@ class ServerAssistant(QMainWindow):
         if hasattr(self, 'current_runnable') and self.current_runnable and getattr(self.current_runnable, 'is_running', False):
             self.current_runnable.stop()
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户停止当前命令")
+            if hasattr(self, 'stop_button') and self.stop_button:
+                self.stop_button.setEnabled(False)
+                self.stop_button.setText('正在停止，等待提示符...')
+            return
         self.remove_stop_button()
     
     def eventFilter(self, obj, event):
@@ -1250,82 +1909,88 @@ class ServerAssistant(QMainWindow):
     def on_tab_pressed(self):
         """处理Tab键按下事件"""
         current_text = self.command_input.text()
-        
+
         # 检查是否是 cd 命令
         if current_text.startswith('cd '):
             path_prefix = current_text[3:].strip()
-            
+
             server_name = None
             if self.server_tabs.count() > 0:
                 server_name = self.server_tabs.tabText(self.server_tabs.currentIndex())
-            
+
             if server_name and self.server_manager.is_connected(server_name):
                 current_dir = self.current_dirs.get(server_name, "/")
                 client = self.server_manager.get_connection(server_name)
-                
+
                 if client:
-                    try:
-                        if path_prefix:
-                            # 处理相对路径和绝对路径（远程服务器使用 POSIX 路径语义）
-                            if path_prefix.startswith('/'):
-                                # 绝对路径
-                                parent_dir = posixpath.dirname(path_prefix)
-                                if not parent_dir:
-                                    parent_dir = '/'
-                                search_prefix = posixpath.basename(path_prefix)
-                            else:
-                                # 相对路径
-                                parent_dir = current_dir
-                                search_prefix = path_prefix
-                            
-                            safe_dir = parent_dir.replace('"', '\\"')
-                            stdin, stdout, stderr = client.exec_command(f'ls -la "{safe_dir}"', timeout=TIMEOUT_EXEC_MEDIUM)
+                    if path_prefix:
+                        search_prefix = posixpath.basename(path_prefix)
+                        relative_parent = posixpath.dirname(path_prefix)
+                        if path_prefix.startswith('/'):
+                            parent_dir = relative_parent or '/'
                         else:
-                            safe_dir = current_dir.replace('"', '\\"')
-                            stdin, stdout, stderr = client.exec_command(f'ls -la "{safe_dir}"', timeout=TIMEOUT_EXEC_MEDIUM)
-                            search_prefix = ''
-                        
-                        output = stdout.read().decode('utf-8', errors='replace')
-                        
-                        files = []
-                        for line in output.split('\n')[1:]:
-                            if not line.strip():
-                                continue
-                            parts = line.split()
-                            if len(parts) >= 9:
-                                filename = parts[-1]
-                                if filename not in ['.', '..']:
-                                    is_dir = parts[0].startswith('d')
-                                    if search_prefix:
-                                        if filename.startswith(search_prefix):
-                                            if is_dir:
-                                                filename += '/'
-                                            files.append(filename)
-                                    else:
-                                        if is_dir:
-                                            filename += '/'
-                                        files.append(filename)
-                        
-                        if files:
-                            files.sort()
+                            parent_dir = posixpath.normpath(
+                                posixpath.join(current_dir, relative_parent)
+                            ) if relative_parent else current_dir
+                    else:
+                        parent_dir = current_dir
+                        search_prefix = ''
+
+                    def show_path_completions(files):
+                        if self.command_input.text() != current_text:
+                            return
+                        if self.server_tabs.count() <= 0:
+                            return
+                        active_server = self.server_tabs.tabText(
+                            self.server_tabs.currentIndex()
+                        )
+                        if active_server != server_name:
+                            return
+                        matches = sorted(
+                            filename for filename in files
+                            if filename.rstrip('/').startswith(search_prefix)
+                        )
+                        if matches:
                             completer = self.command_input.completer()
                             if completer:
                                 completer.setModel(None)
-                                model = QStringListModel(files)
-                                completer.setModel(model)
+                                completer.setModel(QStringListModel(matches))
                                 completer.complete()
                         else:
-                            # 没有匹配的文件，显示提示
-                            self.command_log.append(f"  没有找到匹配 '{search_prefix}' 的目录")
-                    except Exception as e:
-                        self.command_log.append(f"  补全错误: {e}")
+                            self.command_log.append(
+                                f"  没有找到匹配 '{search_prefix}' 的目录"
+                            )
+
+                    self._start_file_list_request(
+                        client,
+                        server_name,
+                        parent_dir,
+                        show_path_completions,
+                    )
             else:
                 self.command_log.append("  请先连接服务器")
-        
+
         # 默认触发补全
         completer = self.command_input.completer()
         if completer:
             completer.complete()
+
+    def _start_file_list_request(self, client, server_name, current_dir, callback):
+        runnable = FileListRunnable(client, server_name, current_dir)
+        instance_state = object.__getattribute__(self, '__dict__')
+        active_runnables = instance_state.setdefault('_file_list_runnables', set())
+        active_runnables.add(runnable)
+
+        def deliver_result(result_server, result_dir, files):
+            if result_server == server_name and result_dir == current_dir:
+                callback(list(files))
+
+        def release_runnable():
+            active_runnables.discard(runnable)
+
+        runnable.signals.result.connect(deliver_result)
+        runnable.signals.finished.connect(release_runnable)
+        QThreadPool.globalInstance().start(runnable)
     
     def check_connections_status(self):
         disconnected_servers = []
@@ -1337,8 +2002,9 @@ class ServerAssistant(QMainWindow):
                 self.server_manager.disconnect_server(server_name)
         
         if disconnected_servers:
-            if stopped_current_runnable:
-                self.remove_stop_button()
+            if stopped_current_runnable and hasattr(self, 'stop_button'):
+                self.stop_button.setEnabled(False)
+                self.stop_button.setText('连接已断开，正在清理...')
             self.refresh_server_list()
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到以下服务器连接已断开: {', '.join(disconnected_servers)}")
             for server_name in disconnected_servers:
@@ -1371,11 +2037,14 @@ class ServerAssistant(QMainWindow):
     _dark_keyword_patterns = {k: re.compile(r'\b' + re.escape(k) + r'\b') for k in _dark_keywords}
     _light_keyword_patterns = {k: re.compile(r'\b' + re.escape(k) + r'\b') for k in _light_keywords}
 
-    def highlight_keywords(self, text):
+    def _highlight_plain_text(self, text):
         # 输出面板始终深色，固定使用深色主题配色
         keywords = self._dark_keywords
         patterns = self._dark_keyword_patterns
         ip_color = '#2196f3'
+
+        # 输出通过 insertHtml 写入，必须先转义服务端返回的普通文本。
+        text = html.escape(text)
 
         replacement = f'<span style="color: {ip_color}">\\g<0></span>'
         text = self._ip_pattern.sub(replacement, text)
@@ -1385,9 +2054,22 @@ class ServerAssistant(QMainWindow):
 
         # 先去掉 \r 避免解析成尾部空格，再将 \n 转为 <br>
         text = text.replace('\r', '').replace('\n', '<br>')
-        # 去除末尾多余空格，避免复制时带入
-        text = text.rstrip(' ')
         return text
+
+    def highlight_keywords(self, text):
+        """保留原有关键词高亮，同时解析终端 ANSI 颜色和样式。"""
+        instance_state = object.__getattribute__(self, '__dict__')
+        formatter = instance_state.get('terminal_output_formatter')
+        if formatter is None:
+            formatter = TerminalOutputFormatter(self._highlight_plain_text)
+            instance_state['terminal_output_formatter'] = formatter
+        return formatter.feed(text)
+
+    def reset_terminal_output_formatter(self):
+        instance_state = object.__getattribute__(self, '__dict__')
+        formatter = instance_state.get('terminal_output_formatter')
+        if formatter is not None:
+            formatter.reset()
     
     def load_settings(self):
         if os.path.exists(self.settings_file):
@@ -1636,7 +2318,17 @@ class ServerAssistant(QMainWindow):
         self.setStyleSheet(LIGHT_QSS)
         
         # 输出面板始终深色（终端风格）
-        self.server_output.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d; border-radius: 0px;')
+        self.server_output.setStyleSheet(
+            'background-color: #1e1e1e; color: #ffffff; '
+            'border: 1px solid #3d3d3d; border-radius: 0px; '
+            'font-family: "Consolas", "Courier New", monospace; font-size: 10pt;'
+        )
+        terminal_font = QFont('Consolas', 10)
+        terminal_font.setStyleHint(QFont.Monospace)
+        terminal_font.setFixedPitch(True)
+        self.server_output.setFont(terminal_font)
+        terminal_space_width = QFontMetrics(terminal_font).horizontalAdvance(' ')
+        self.server_output.setTabStopDistance(terminal_space_width * 8)
         self.command_log.setStyleSheet('background-color: #1e1e1e; color: #ffffff; border: 1px solid #3d3d3d; border-radius: 0px;')
         
         # 信号连接
@@ -1737,17 +2429,24 @@ class ServerAssistant(QMainWindow):
                 self.refresh_server_list()
                 self.add_server_tab(server_name)
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 已连接到服务器: {server_name}")
-                # 清空服务器输出窗口，不显示默认提示符
+                # 清空窗口后补回远端原生提示符，后续命令回显会自然接在其后。
                 self.server_output.clear()
                 self.server_output.append('系统就绪，已连接到服务器')
-                
-                # 初始化当前目录
-                client = self.server_manager.get_connection(server_name)
-                if client:
-                    stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
-                    current_dir = stdout.read().decode('utf-8', errors='replace').strip()
+
+                # 提示符钩子已经随连接返回完整 $PWD，无需额外执行 pwd。
+                current_dir = self.server_manager.get_shell_current_dir(server_name)
+                if isinstance(current_dir, str) and current_dir:
                     self.current_dirs[server_name] = current_dir
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 初始化当前目录: {current_dir}")
+                else:
+                    client = self.server_manager.get_connection(server_name)
+                    if client:
+                        stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                        current_dir = stdout.read().decode('utf-8', errors='replace').strip()
+                        self.current_dirs[server_name] = current_dir
+                        self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 兼容模式初始化当前目录: {current_dir}")
+                self.output_shell_server = None
+                self.prepare_output_shell_context(server_name)
             else:
                 QMessageBox.warning(self, '连接失败', f'无法连接到服务器: {server_name}')
         except Exception as e:
@@ -1755,8 +2454,15 @@ class ServerAssistant(QMainWindow):
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 连接服务器时发生错误: {e}")
     
     def disconnect_server(self, server_name):
-        self.stop_runnable_for_server(server_name)
-        self.remove_stop_button()
+        stopped_runnable = self.stop_runnable_for_server(server_name)
+        if stopped_runnable:
+            self.stop_button.setEnabled(False)
+            self.stop_button.setText('连接已断开，正在清理...')
+        elif not (
+            getattr(self, 'current_runnable', None)
+            and getattr(self.current_runnable, 'is_running', False)
+        ):
+            self.remove_stop_button()
         self.server_manager.disconnect_server(server_name)
         self.refresh_server_list()
         for i in range(self.server_tabs.count()):
@@ -1810,17 +2516,44 @@ class ServerAssistant(QMainWindow):
             server_name = self.server_tabs.tabText(current_tab_index)
             shell = self.server_manager.get_shell(server_name)
             if shell:
+                shell_lock = self.server_manager.get_shell_lock(server_name)
+                lock_acquired = False
+                if shell_lock is not None:
+                    try:
+                        lock_acquired = shell_lock.acquire(blocking=False)
+                    except TypeError:
+                        lock_acquired = shell_lock.acquire(False)
+                    if not lock_acquired:
+                        self.command_log.append(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 指令仍在运行，暂不抢读 shell 输出"
+                        )
+                        return
                 # 尝试读取shell中剩余的输出
                 output = ""
                 try:
                     while shell.recv_ready():
                         output += shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
                     if output:
+                        token = self.server_manager.get_shell_status_token(server_name)
+                        if isinstance(token, str) and token:
+                            parser = ShellStatusFrameParser(token)
+                            output, frames = parser.feed(output)
+                            for frame in frames:
+                                current_dir = frame.get('cwd')
+                                if current_dir:
+                                    self.current_dirs[server_name] = current_dir
+                                    self.server_manager.set_shell_current_dir(
+                                        server_name, current_dir
+                                    )
                         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 刷新输出，读取到 {len(output)} 字符")
-                        highlighted_text = self.highlight_keywords(output)
-                        self.append_output(highlighted_text)
+                        if output:
+                            highlighted_text = self.highlight_keywords(output)
+                            self.append_output(highlighted_text)
                 except Exception as e:
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 刷新输出时出错: {e}")
+                finally:
+                    if shell_lock is not None and lock_acquired:
+                        shell_lock.release()
             else:
                 QMessageBox.information(self, '提示', '请先连接服务器')
         else:
@@ -1870,13 +2603,17 @@ class ServerAssistant(QMainWindow):
         self.add_server_tab(server_name, switch=False)
         if server_name not in self.current_dirs:
             try:
-                client = self.server_manager.get_connection(server_name)
-                if client:
+                current_dir = self.server_manager.get_shell_current_dir(server_name)
+                if isinstance(current_dir, str) and current_dir:
+                    self.current_dirs[server_name] = current_dir
+                else:
+                    client = self.server_manager.get_connection(server_name)
+                    if not client:
+                        self.current_dirs[server_name] = '/'
+                        return
                     stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
                     current_dir = stdout.read().decode('utf-8', errors='replace').strip()
                     self.current_dirs[server_name] = current_dir
-                else:
-                    self.current_dirs[server_name] = '/'
             except Exception:
                 self.current_dirs[server_name] = '/'
     
@@ -1929,8 +2666,8 @@ class ServerAssistant(QMainWindow):
             'continuous': is_continuous_command(command)
         }
         
-        # 执行命令
-        self._execute_command_continue(command_info, server_name)
+        # 手工输入与按钮指令共用同一入口，避免绕过运行中检查。
+        self._execute_command_main(server_name, command_info)
     
     def setup_command_completer(self):
         # 常用 Linux 命令
@@ -1979,36 +2716,27 @@ class ServerAssistant(QMainWindow):
         client = self.server_manager.get_connection(server_name)
         if not client:
             return
-        
-        try:
-            safe_dir = current_dir.replace('"', '\\"')
-            stdin, stdout, stderr = client.exec_command(f'ls -la "{safe_dir}"', timeout=TIMEOUT_EXEC_MEDIUM)
-            output = stdout.read().decode('utf-8', errors='replace')
-            
-            # 解析文件列表
-            files = []
-            for line in output.split('\n')[1:]:  # 跳过第一行（total）
-                if not line.strip():
-                    continue
-                parts = line.split()
-                if len(parts) >= 9:
-                    filename = parts[-1]
-                    # 排除 . 和 ..
-                    if filename not in ['.', '..']:
-                        # 如果是目录，添加 /
-                        if parts[0].startswith('d'):
-                            filename += '/'
-                        files.append(filename)
-            
-            # 更新补全器
-            if files:
-                all_commands = list(set(self.command_completer_model + files))
-                all_commands.sort()
-                self.command_completer.setModel(None)
-                self.command_completer_model = all_commands
-                self.command_completer.setModel(QStringListModel(all_commands))
-        except Exception:
-            pass
+
+        def apply_file_list(files):
+            # 用户可能已切换服务器或目录；过期结果不能覆盖当前补全状态。
+            if self.current_dirs.get(server_name) != current_dir:
+                return
+            if self.server_tabs.count() <= 0:
+                return
+            active_server = self.server_tabs.tabText(self.server_tabs.currentIndex())
+            if active_server != server_name or not files:
+                return
+            all_commands = sorted(set(self.command_completer_model + list(files)))
+            self.command_completer.setModel(None)
+            self.command_completer_model = all_commands
+            self.command_completer.setModel(QStringListModel(all_commands))
+
+        self._start_file_list_request(
+            client,
+            server_name,
+            current_dir,
+            apply_file_list,
+        )
     
     def refresh_default_command_buttons(self):
         # 清空现有按钮
@@ -2127,23 +2855,30 @@ class ServerAssistant(QMainWindow):
             linked_cmd = self.find_linked_command(linked_spec) if linked_spec else None
             if linked_cmd:
                 delay = command_info.get('linked_delay', 0)
-                # 先执行关联指令（标记为 from_linked=True，防止递归触发关联）
-                self.execute_command(server_name, linked_cmd, from_linked=True)
-                # 延迟后执行自身指令
-                QTimer.singleShot(delay, lambda: self._execute_command_main(server_name, command_info))
+                # 延时从前置指令真正完成后开始，不能在其仍运行时启动主指令。
+                def run_main_after_linked():
+                    QTimer.singleShot(
+                        delay,
+                        lambda: self._execute_command_main(server_name, command_info),
+                    )
+
+                self._execute_command_main(
+                    server_name,
+                    linked_cmd,
+                    completion_callback=run_main_after_linked,
+                )
                 return
             else:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 警告: 未找到关联指令，继续执行当前指令")
         
         self._execute_command_main(server_name, command_info)
     
-    def _execute_command_main(self, server_name, command_info):
+    def _execute_command_main(self, server_name, command_info, completion_callback=None):
         """执行指令的主体逻辑（连接检查、持续运行冲突检查等）"""
         command = command_info['command']
         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 执行命令: {command}")
         
         if not self.server_manager.is_connection_alive(server_name):
-            self.remove_stop_button()
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
             self.refresh_server_list()
             if not self.server_manager.ensure_connection(server_name):
@@ -2151,6 +2886,9 @@ class ServerAssistant(QMainWindow):
                 self.command_log.append(f"  错误: 无法重新连接到服务器 {server_name}")
                 return
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 重新连接成功")
+            reconnected_dir = self.server_manager.get_shell_current_dir(server_name)
+            if isinstance(reconnected_dir, str) and reconnected_dir:
+                self.current_dirs[server_name] = reconnected_dir
             self.refresh_server_list()
         
         client = self.server_manager.get_connection(server_name)
@@ -2162,6 +2900,11 @@ class ServerAssistant(QMainWindow):
         # 检查是否有持续运行的指令（只对持续输出指令弹窗）
         is_current_running = hasattr(self, 'current_runnable') and self.current_runnable and self.current_runnable.is_running
         if is_current_running:
+            if getattr(self.current_runnable, 'stop_requested', False):
+                self.command_log.append(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 当前指令正在停止，请等待提示符恢复"
+                )
+                return
             reply = QMessageBox.question(
                 self,
                 '指令正在运行',
@@ -2170,19 +2913,34 @@ class ServerAssistant(QMainWindow):
                 QMessageBox.No
             )
             if reply == QMessageBox.Yes:
-                self.current_runnable.stop()
-                self.remove_stop_button()
+                previous_runnable = self.current_runnable
+
+                def continue_after_previous_finished():
+                    self._execute_command_continue(
+                        command_info,
+                        server_name,
+                        completion_callback,
+                    )
+
+                previous_runnable.signals.finished.connect(
+                    continue_after_previous_finished
+                )
+                previous_runnable.stop()
+                self.stop_button.setEnabled(False)
+                self.stop_button.setText('正在停止，等待提示符...')
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户停止当前指令，准备执行新指令")
-                # 使用QTimer延迟执行新指令，避免阻塞GUI
-                QTimer.singleShot(200, lambda: self._execute_command_continue(command_info, server_name))
                 return
             else:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户取消执行新指令")
                 return
         
-        self._execute_command_continue(command_info, server_name)
+        self._execute_command_continue(
+            command_info,
+            server_name,
+            completion_callback,
+        )
     
-    def _execute_command_continue(self, command_info, server_name):
+    def _execute_command_continue(self, command_info, server_name, completion_callback=None):
         client = self.server_manager.get_connection(server_name)
         if not client:
             QMessageBox.warning(self, '未连接', f'服务器 {server_name} 未连接')
@@ -2228,7 +2986,8 @@ class ServerAssistant(QMainWindow):
             else:
                 # 执行普通命令
                 self.command_log.append(f"  连接服务器: {server_name}")
-                
+                self.prepare_output_shell_context(server_name)
+
                 # 提交任务到线程池
                 is_continuous = command_info.get('continuous', False)
                 
@@ -2242,25 +3001,38 @@ class ServerAssistant(QMainWindow):
                 
                 def on_command_result(result):
                     self.flush_partial_output()
+                    self.prepare_output_shell_context(server_name)
                     self.command_log.append(f"  收到命令执行结果")
                     highlighted_text = self.highlight_keywords(result)
                     self.append_output(highlighted_text)
                     self.command_log.append("  执行完成")
-                    self.remove_stop_button_for_runnable(runnable)
                 
                 def on_partial_result(partial):
+                    if object.__getattribute__(self, '__dict__').get('output_shell_server') != server_name:
+                        self.flush_partial_output()
+                    self.prepare_output_shell_context(server_name)
                     self.append_partial_output(partial)
                 
                 def on_finished():
                     self.flush_partial_output()
+                    self.reset_terminal_output_formatter()
                     self.command_log.append("  命令执行完成")
                     self.remove_stop_button_for_runnable(runnable)
+                    if completion_callback and runnable.stop_reason not in (
+                        'user', 'timeout', 'shell_closed'
+                    ):
+                        completion_callback()
                 
                 def on_current_dir_updated(server_name, current_dir):
                     self.current_dirs[server_name] = current_dir
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 更新当前目录: {current_dir}")
-                    # 更新文件补全
-                    self.update_command_completer_with_files()
+                    # 只刷新当前页签的文件补全，并在后台执行远端目录查询。
+                    if self.server_tabs.count() > 0:
+                        active_server = self.server_tabs.tabText(
+                            self.server_tabs.currentIndex()
+                        )
+                        if active_server == server_name:
+                            self.update_command_completer_with_files()
                 
                 runnable.signals.result.connect(on_command_result)
                 runnable.signals.partial_result.connect(on_partial_result)
@@ -2270,6 +3042,11 @@ class ServerAssistant(QMainWindow):
                 
                 QThreadPool.globalInstance().start(runnable)
                 self.command_log.append(f"  线程池任务已启动")
+
+                return
+
+            if completion_callback:
+                completion_callback()
                 
 
         except Exception as e:
@@ -2311,7 +3088,6 @@ class ServerAssistant(QMainWindow):
     
     def download_file(self, server_name, file_path):
         if not self.server_manager.is_connection_alive(server_name):
-            self.remove_stop_button()
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
             self.refresh_server_list()
             if not self.server_manager.ensure_connection(server_name):
@@ -2412,36 +3188,18 @@ class ServerAssistant(QMainWindow):
                     current_dir = self.current_dirs[server_name]
                     self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 使用保存的当前目录: {current_dir}")
                 else:
-                    # 如果没有保存的目录，快速从shell或exec_command获取
+                    # 优先使用提示符状态帧缓存，避免向交互 shell 注入 pwd。
                     client = self.server_manager.get_connection(server_name)
-                    shell = self.server_manager.get_shell(server_name)
-                    current_dir = "/"
-                    
-                    if shell:
-                        try:
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从shell获取当前目录")
-                            shell.send('pwd\n')
-                            pwd_output = ""
-                            attempt = 0
-                            while attempt < RECV_MAX_ATTEMPTS:
-                                time.sleep(RECV_SHELL_DELAY)
-                                if shell.recv_ready():
-                                    pwd_output += shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
-                                    attempt = 0
-                                else:
-                                    attempt += 1
-
-                            current_dir = parse_pwd_output(pwd_output)
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 当前目录: {current_dir}")
-                        except Exception as e:
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
-                            current_dir = "/"
+                    cached_dir = self.server_manager.get_shell_current_dir(server_name)
+                    if isinstance(cached_dir, str) and cached_dir:
+                        current_dir = cached_dir
+                        self.current_dirs[server_name] = current_dir
                     else:
-                        # 没有shell会话，使用exec_command
+                        current_dir = "/"
                         try:
                             stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
                             current_dir = stdout.read().decode('utf-8', errors='replace').strip()
-                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从exec_command获取当前目录: {current_dir}")
+                            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 兼容模式获取当前目录: {current_dir}")
                         except Exception as e:
                             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
                             current_dir = "/"
@@ -2456,42 +3214,22 @@ class ServerAssistant(QMainWindow):
         if server_name in self.current_dirs:
             return self.current_dirs[server_name]
 
-        shell = self.server_manager.get_shell(server_name)
+        cached_dir = self.server_manager.get_shell_current_dir(server_name)
+        if isinstance(cached_dir, str) and cached_dir:
+            return cached_dir
+
         current_dir = "/"
-
-        if shell:
-            try:
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从shell获取当前目录")
-                shell.send('pwd\n')
-                pwd_output = ""
-                attempt = 0
-                while attempt < RECV_MAX_ATTEMPTS:
-                    time.sleep(RECV_SHELL_DELAY)
-                    if shell.recv_ready():
-                        pwd_output += shell.recv(RECV_CHUNK_SIZE).decode('utf-8', errors='replace')
-                        attempt = 0
-                    else:
-                        attempt += 1
-
-                current_dir = parse_pwd_output(pwd_output)
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 当前目录: {current_dir}")
-            except Exception as e:
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
-                current_dir = "/"
-        else:
-            try:
-                stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
-                current_dir = stdout.read().decode('utf-8', errors='replace').strip()
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 从exec_command获取当前目录: {current_dir}")
-            except Exception as e:
-                self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
-                current_dir = "/"
+        try:
+            stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+            current_dir = stdout.read().decode('utf-8', errors='replace').strip()
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 兼容模式获取当前目录: {current_dir}")
+        except Exception as e:
+            self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 获取目录失败: {e}")
 
         return current_dir
 
     def upload_file(self, server_name):
         if not self.server_manager.is_connection_alive(server_name):
-            self.remove_stop_button()
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
             self.refresh_server_list()
             if not self.server_manager.ensure_connection(server_name):
@@ -2577,7 +3315,6 @@ class ServerAssistant(QMainWindow):
                 return
         
         if not self.server_manager.is_connection_alive(server_name):
-            self.remove_stop_button()
             self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 检测到连接已断开，尝试重新连接...")
             self.refresh_server_list()
             if not self.server_manager.ensure_connection(server_name):
@@ -2883,7 +3620,15 @@ class ServerAssistant(QMainWindow):
             self.save_settings()
     
     def on_server_tab_changed(self, index):
-        self.remove_stop_button()
+        running = getattr(self, 'current_runnable', None)
+        if running is not None and getattr(running, 'is_running', False):
+            self.stop_button.setEnabled(not getattr(running, 'stop_requested', False))
+            if getattr(running, 'stop_requested', False):
+                self.stop_button.setText('正在停止，等待提示符...')
+            else:
+                self.stop_button.setText(f'停止命令 ({running.server_name})')
+        else:
+            self.remove_stop_button()
         if index >= 0:
             server_name = self.server_tabs.tabText(index)
             self.server_output.clear()
@@ -2905,19 +3650,29 @@ class ServerAssistant(QMainWindow):
                 self.server_output.append(f'当前目录: {current_dir}')
             else:
                 # 尝试获取当前目录
-                client = self.server_manager.get_connection(server_name)
-                if client:
-                    try:
-                        stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
-                        current_dir = stdout.read().decode('utf-8', errors='replace').strip()
-                        self.current_dirs[server_name] = current_dir
-                        self.server_output.append(f'当前目录: {current_dir}')
-                    except Exception as e:
-                        self.server_output.append(f'获取当前目录失败: {e}')
+                cached_dir = self.server_manager.get_shell_current_dir(server_name)
+                if isinstance(cached_dir, str) and cached_dir:
+                    self.current_dirs[server_name] = cached_dir
+                    self.server_output.append(f'当前目录: {cached_dir}')
+                else:
+                    client = self.server_manager.get_connection(server_name)
+                    if not client:
+                        self.current_dirs[server_name] = '/'
+                    else:
+                        try:
+                            stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                            current_dir = stdout.read().decode('utf-8', errors='replace').strip()
+                            self.current_dirs[server_name] = current_dir
+                            self.server_output.append(f'当前目录: {current_dir}')
+                        except Exception as e:
+                            self.server_output.append(f'获取当前目录失败: {e}')
+            self.output_shell_server = None
+            self.prepare_output_shell_context(server_name)
         else:
             # 没有选中任何标签
             self.server_output.clear()
             self.server_output.append('系统就绪，等待连接...')
+            self.output_shell_server = None
 
 class LayoutSettingsDialog(QDialog):
     def __init__(self, layout_params, parent=None):
