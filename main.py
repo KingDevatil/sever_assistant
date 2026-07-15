@@ -4,9 +4,10 @@
 import sys
 import re
 import html
+import copy
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter, QInputDialog, QSpinBox
 from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject, QStringListModel
-from PyQt5.QtGui import QFont, QFontMetrics, QColor, QTextCursor, QIntValidator, QPixmap, QPainter
+from PyQt5.QtGui import QFont, QFontMetrics, QColor, QTextCursor, QTextDocument, QIntValidator, QPixmap, QPainter
 import paramiko
 import json
 import os
@@ -1372,6 +1373,29 @@ class CommandManager:
             if command_index < len(category['commands']):
                 category['commands'][command_index] = command_info
                 self.save_commands()
+
+    def copy_command(self, category_index, command_index):
+        """复制指令到原位置之后，并为副本生成分类内唯一名称。"""
+        if not 0 <= category_index < len(self.commands):
+            return None
+        commands = self.commands[category_index].get('commands', [])
+        if not 0 <= command_index < len(commands):
+            return None
+
+        copied_command = copy.deepcopy(commands[command_index])
+        source_name = str(copied_command.get('name', '')).strip()
+        base_name = re.sub(r' - 副本(?: \d+)?$', '', source_name) or '未命名指令'
+        existing_names = {str(command.get('name', '')) for command in commands}
+        copied_name = f'{base_name} - 副本'
+        suffix = 2
+        while copied_name in existing_names:
+            copied_name = f'{base_name} - 副本 {suffix}'
+            suffix += 1
+        copied_command['name'] = copied_name
+
+        commands.insert(command_index + 1, copied_command)
+        self.save_commands()
+        return copied_command
     
     def remove_command(self, category_index, command_index):
         if category_index < len(self.commands):
@@ -1620,16 +1644,18 @@ class CommandDialog(QDialog):
         self.params.append((param_edit, hint_edit, param_widget))
     
     def delete_param(self, param_widget):
-        index = self.params_layout.indexOf(param_widget)
-        if index >= 0:
-            widget = self.params_layout.takeAt(index).widget()
-            if widget:
-                widget.deleteLater()
-            # 从params列表中移除
-            for i, (param_edit, hint_edit, pw) in enumerate(self.params):
-                if pw == param_widget:
-                    self.params.pop(i)
-                    break
+        if self.params_layout.indexOf(param_widget) < 0:
+            return
+
+        # 先同步移除数据项，再立即隐藏并解除父子关系。仅调用 deleteLater()
+        # 会让旧行在事件循环销毁前继续显示，与已经上移的行发生视觉重叠。
+        self.params = [entry for entry in self.params if entry[2] is not param_widget]
+        self.params_layout.removeWidget(param_widget)
+        param_widget.hide()
+        param_widget.setParent(None)
+        param_widget.deleteLater()
+        self.params_layout.invalidate()
+        self.params_layout.activate()
     
     def get_command_info(self):
         params = []
@@ -1739,6 +1765,8 @@ class ServerAssistant(QMainWindow):
         self.current_dirs = {}  # 存储每个服务器的当前目录
         self._file_list_runnables = set()
         self.output_shell_server = None
+        self.output_tab_states = {}
+        self.active_output_tab_key = None
         self.settings_file = os.path.join(self.server_manager.base_dir, 'settings.json')
         
         # 布局参数默认值
@@ -1762,6 +1790,7 @@ class ServerAssistant(QMainWindow):
         self.output_mutex = QMutex()
         self.partial_output_buffer = []
         self.partial_output_buffer_chars = 0
+        self.partial_output_tab_key = None
         self.partial_output_timer = QTimer(self)
         self.partial_output_timer.setSingleShot(True)
         self.partial_output_timer.setInterval(100)
@@ -1805,34 +1834,154 @@ class ServerAssistant(QMainWindow):
         
         event.accept()
     
-    def append_output(self, text, is_html=True):
-        with QMutexLocker(self.output_mutex):
-            cursor = self.server_output.textCursor()
-            cursor.movePosition(QTextCursor.End)
-            self.server_output.setTextCursor(cursor)
-            if is_html:
-                # QTextEdit 按 HTML 规则会折叠连续空格；pre-wrap 保留终端列宽并允许长行换行。
-                self.server_output.insertHtml(
-                    f'<span style="white-space: pre-wrap">{text}</span>'
-                )
-            else:
-                self.server_output.insertPlainText(text)
-            self.trim_text_edit_chars(self.server_output, SERVER_OUTPUT_MAX_CHARS, SERVER_OUTPUT_TRIM_TO_CHARS)
-            self.server_output.ensureCursorVisible()
+    def get_current_output_tab_key(self):
+        instance_state = object.__getattribute__(self, '__dict__')
+        active_key = instance_state.get('active_output_tab_key')
+        if active_key is not None:
+            return active_key
+        server_tabs = instance_state.get('server_tabs')
+        if server_tabs is not None and server_tabs.currentIndex() >= 0:
+            return server_tabs.tabText(server_tabs.currentIndex())
+        return None
 
-    def prepare_output_shell_context(self, server_name):
+    def _ensure_output_tab_state(self, output_tab_key):
+        if output_tab_key is None:
+            return None
+        instance_state = object.__getattribute__(self, '__dict__')
+        states = instance_state.setdefault('output_tab_states', {})
+        state = states.get(output_tab_key)
+        if state is None:
+            state = {
+                'html': '',
+                'scroll': 0,
+                'shell_server': None,
+                'formatter': TerminalOutputFormatter(self._highlight_plain_text),
+            }
+            states[output_tab_key] = state
+        return state
+
+    @staticmethod
+    def _document_from_output_state(state):
+        document = QTextDocument()
+        document.setMaximumBlockCount(SERVER_OUTPUT_MAX_BLOCKS)
+        if state and state.get('html'):
+            document.setHtml(state['html'])
+        return document
+
+    @staticmethod
+    def _trim_document_chars(document, max_chars, trim_to_chars):
+        char_count = document.characterCount()
+        if char_count <= max_chars:
+            return
+        remove_count = max(0, char_count - trim_to_chars)
+        trim_cursor = QTextCursor(document)
+        trim_cursor.setPosition(0)
+        trim_cursor.setPosition(remove_count, QTextCursor.KeepAnchor)
+        trim_cursor.removeSelectedText()
+
+    def _save_active_output_state(self):
+        instance_state = object.__getattribute__(self, '__dict__')
+        output_tab_key = instance_state.get('active_output_tab_key')
+        if output_tab_key is None or 'server_output' not in instance_state:
+            return
+        state = self._ensure_output_tab_state(output_tab_key)
+        state['html'] = self.server_output.document().toHtml()
+        state['scroll'] = self.server_output.verticalScrollBar().value()
+
+    def _restore_output_tab_state(self, output_tab_key):
+        state = self._ensure_output_tab_state(output_tab_key)
+        self.server_output.setHtml(state.get('html') or '')
+        self.server_output.document().setMaximumBlockCount(SERVER_OUTPUT_MAX_BLOCKS)
+        self.server_output.verticalScrollBar().setValue(state.get('scroll', 0))
+        self.output_shell_server = state.get('shell_server')
+
+    def _output_plain_text(self, output_tab_key):
+        if output_tab_key == self.get_current_output_tab_key():
+            return self.server_output.toPlainText()
+        state = self._ensure_output_tab_state(output_tab_key)
+        return self._document_from_output_state(state).toPlainText()
+
+    def append_output(self, text, is_html=True, output_tab_key=None):
+        if output_tab_key is None:
+            output_tab_key = self.get_current_output_tab_key()
+        active_output_tab_key = object.__getattribute__(self, '__dict__').get(
+            'active_output_tab_key'
+        )
+
+        with QMutexLocker(self.output_mutex):
+            if output_tab_key is None or output_tab_key == active_output_tab_key:
+                cursor = self.server_output.textCursor()
+                cursor.movePosition(QTextCursor.End)
+                self.server_output.setTextCursor(cursor)
+                if is_html:
+                    # QTextEdit 按 HTML 规则会折叠连续空格；pre-wrap 保留终端列宽并允许长行换行。
+                    self.server_output.insertHtml(
+                        f'<span style="white-space: pre-wrap">{text}</span>'
+                    )
+                else:
+                    self.server_output.insertPlainText(text)
+                self.trim_text_edit_chars(
+                    self.server_output,
+                    SERVER_OUTPUT_MAX_CHARS,
+                    SERVER_OUTPUT_TRIM_TO_CHARS,
+                )
+                self.server_output.ensureCursorVisible()
+                if output_tab_key is not None:
+                    state = self._ensure_output_tab_state(output_tab_key)
+                    state['html'] = self.server_output.document().toHtml()
+                    state['scroll'] = self.server_output.verticalScrollBar().value()
+                return
+
+            state = self._ensure_output_tab_state(output_tab_key)
+            document = self._document_from_output_state(state)
+            cursor = QTextCursor(document)
+            cursor.movePosition(QTextCursor.End)
+            if is_html:
+                cursor.insertHtml(f'<span style="white-space: pre-wrap">{text}</span>')
+            else:
+                cursor.insertText(text)
+            self._trim_document_chars(
+                document,
+                SERVER_OUTPUT_MAX_CHARS,
+                SERVER_OUTPUT_TRIM_TO_CHARS,
+            )
+            state['html'] = document.toHtml()
+
+    def prepare_output_shell_context(self, server_name, output_tab_key=None):
         """目标服务器改变时补回其原生提示符，随后仍可恢复原服务器输出。"""
         instance_state = object.__getattribute__(self, '__dict__')
-        if instance_state.get('output_shell_server') == server_name:
+        if output_tab_key is None:
+            output_tab_key = self.get_current_output_tab_key()
+
+        state = self._ensure_output_tab_state(output_tab_key)
+        current_shell_server = (
+            state.get('shell_server') if state is not None
+            else instance_state.get('output_shell_server')
+        )
+        if current_shell_server == server_name:
             return
 
         prompt = self.server_manager.get_shell_prompt(server_name)
         if isinstance(prompt, str) and prompt:
-            existing_text = self.server_output.toPlainText()
+            existing_text = (
+                self._output_plain_text(output_tab_key)
+                if output_tab_key is not None
+                else self.server_output.toPlainText()
+            )
             separator = '' if not existing_text or existing_text.endswith('\n') else '\n'
-            self.reset_terminal_output_formatter()
-            self.append_output(self.highlight_keywords(separator + prompt))
-        instance_state['output_shell_server'] = server_name
+            self.reset_terminal_output_formatter(output_tab_key)
+            highlighted_prompt = self.highlight_keywords(
+                separator + prompt,
+                output_tab_key,
+            )
+            self.append_output(
+                highlighted_prompt,
+                output_tab_key=output_tab_key,
+            )
+        if state is not None:
+            state['shell_server'] = server_name
+        if output_tab_key == self.get_current_output_tab_key():
+            instance_state['output_shell_server'] = server_name
 
     def trim_text_edit_chars(self, text_edit, max_chars, trim_to_chars):
         document = text_edit.document()
@@ -1849,7 +1998,12 @@ class ServerAssistant(QMainWindow):
         cursor.setPosition(max(0, old_position - remove_count))
         text_edit.setTextCursor(cursor)
 
-    def append_partial_output(self, text):
+    def append_partial_output(self, text, output_tab_key=None):
+        instance_state = object.__getattribute__(self, '__dict__')
+        buffered_tab_key = instance_state.get('partial_output_tab_key')
+        if self.partial_output_buffer and buffered_tab_key != output_tab_key:
+            self.flush_partial_output()
+        instance_state['partial_output_tab_key'] = output_tab_key
         self.partial_output_buffer.append(text)
         self.partial_output_buffer_chars += len(text)
         if self.partial_output_buffer_chars >= PARTIAL_OUTPUT_FLUSH_CHARS:
@@ -1862,9 +2016,21 @@ class ServerAssistant(QMainWindow):
         if not self.partial_output_buffer:
             return
         text = ''.join(self.partial_output_buffer)
+        output_tab_key = object.__getattribute__(self, '__dict__').get(
+            'partial_output_tab_key'
+        )
         self.partial_output_buffer.clear()
         self.partial_output_buffer_chars = 0
-        self.append_output(self.highlight_keywords(text))
+        object.__getattribute__(self, '__dict__')['partial_output_tab_key'] = None
+        if output_tab_key is None:
+            highlighted_text = self.highlight_keywords(text)
+            self.append_output(highlighted_text)
+        else:
+            highlighted_text = self.highlight_keywords(text, output_tab_key)
+            self.append_output(
+                highlighted_text,
+                output_tab_key=output_tab_key,
+            )
     
     def remove_stop_button(self):
         if hasattr(self, 'stop_button') and self.stop_button:
@@ -2056,18 +2222,28 @@ class ServerAssistant(QMainWindow):
         text = text.replace('\r', '').replace('\n', '<br>')
         return text
 
-    def highlight_keywords(self, text):
+    def highlight_keywords(self, text, output_tab_key=None):
         """保留原有关键词高亮，同时解析终端 ANSI 颜色和样式。"""
         instance_state = object.__getattribute__(self, '__dict__')
-        formatter = instance_state.get('terminal_output_formatter')
-        if formatter is None:
-            formatter = TerminalOutputFormatter(self._highlight_plain_text)
-            instance_state['terminal_output_formatter'] = formatter
+        if output_tab_key is None:
+            output_tab_key = self.get_current_output_tab_key()
+        if output_tab_key is not None:
+            formatter = self._ensure_output_tab_state(output_tab_key)['formatter']
+        else:
+            formatter = instance_state.get('terminal_output_formatter')
+            if formatter is None:
+                formatter = TerminalOutputFormatter(self._highlight_plain_text)
+                instance_state['terminal_output_formatter'] = formatter
         return formatter.feed(text)
 
-    def reset_terminal_output_formatter(self):
+    def reset_terminal_output_formatter(self, output_tab_key=None):
         instance_state = object.__getattribute__(self, '__dict__')
-        formatter = instance_state.get('terminal_output_formatter')
+        if output_tab_key is None:
+            output_tab_key = self.get_current_output_tab_key()
+        if output_tab_key is not None:
+            formatter = self._ensure_output_tab_state(output_tab_key).get('formatter')
+        else:
+            formatter = instance_state.get('terminal_output_formatter')
         if formatter is not None:
             formatter.reset()
     
@@ -2429,9 +2605,12 @@ class ServerAssistant(QMainWindow):
                 self.refresh_server_list()
                 self.add_server_tab(server_name)
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 已连接到服务器: {server_name}")
-                # 清空窗口后补回远端原生提示符，后续命令回显会自然接在其后。
-                self.server_output.clear()
-                self.server_output.append('系统就绪，已连接到服务器')
+                # 重连也保留该页签原有历史，只追加连接状态和新的原生提示符。
+                self.append_output(
+                    '\n系统就绪，已连接到服务器\n',
+                    is_html=False,
+                    output_tab_key=server_name,
+                )
 
                 # 提示符钩子已经随连接返回完整 $PWD，无需额外执行 pwd。
                 current_dir = self.server_manager.get_shell_current_dir(server_name)
@@ -2445,8 +2624,10 @@ class ServerAssistant(QMainWindow):
                         current_dir = stdout.read().decode('utf-8', errors='replace').strip()
                         self.current_dirs[server_name] = current_dir
                         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 兼容模式初始化当前目录: {current_dir}")
-                self.output_shell_server = None
-                self.prepare_output_shell_context(server_name)
+                self._ensure_output_tab_state(server_name)['shell_server'] = None
+                if self.get_current_output_tab_key() == server_name:
+                    self.output_shell_server = None
+                self.prepare_output_shell_context(server_name, server_name)
             else:
                 QMessageBox.warning(self, '连接失败', f'无法连接到服务器: {server_name}')
         except Exception as e:
@@ -2800,10 +2981,20 @@ class ServerAssistant(QMainWindow):
             row = 0
             col = 0
             
-            for command in category['commands']:
+            for command_index, command in enumerate(category['commands']):
                 button = QPushButton(command['name'])
                 button.setFixedWidth(self.layout_params['button_width'])
                 button.setFixedHeight(self.layout_params['button_height'])
+                button.setContextMenuPolicy(Qt.CustomContextMenu)
+                button.customContextMenuRequested.connect(
+                    lambda position, source=button, category_index=i, command_index=command_index:
+                    self.show_command_button_context_menu(
+                        source,
+                        position,
+                        category_index,
+                        command_index,
+                    )
+                )
                 if server_name:
                     button.clicked.connect(lambda checked, cmd=command, srv=server_name: self.execute_command(srv, cmd))
                 else:
@@ -2839,6 +3030,9 @@ class ServerAssistant(QMainWindow):
         return None
 
     def execute_command(self, server_name, command_info, from_linked=False):
+        # 输出始终归属于用户发起命令时所在的页签。即使期间切换页签，
+        # 后台返回和目标服务器的临时提示符也不会写进新页签。
+        output_tab_key = self.get_current_output_tab_key()
         # 仅主指令可切换目标服务器，关联指令继承主指令解析后的服务器
         if not from_linked:
             target = command_info.get('target_server')
@@ -2857,23 +3051,54 @@ class ServerAssistant(QMainWindow):
                 delay = command_info.get('linked_delay', 0)
                 # 延时从前置指令真正完成后开始，不能在其仍运行时启动主指令。
                 def run_main_after_linked():
+                    def run_main():
+                        if output_tab_key is None:
+                            self._execute_command_main(server_name, command_info)
+                        else:
+                            self._execute_command_main(
+                                server_name,
+                                command_info,
+                                output_tab_key=output_tab_key,
+                            )
+
                     QTimer.singleShot(
                         delay,
-                        lambda: self._execute_command_main(server_name, command_info),
+                        run_main,
                     )
 
-                self._execute_command_main(
-                    server_name,
-                    linked_cmd,
-                    completion_callback=run_main_after_linked,
-                )
+                if output_tab_key is None:
+                    self._execute_command_main(
+                        server_name,
+                        linked_cmd,
+                        completion_callback=run_main_after_linked,
+                    )
+                else:
+                    self._execute_command_main(
+                        server_name,
+                        linked_cmd,
+                        completion_callback=run_main_after_linked,
+                        output_tab_key=output_tab_key,
+                    )
                 return
             else:
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 警告: 未找到关联指令，继续执行当前指令")
         
-        self._execute_command_main(server_name, command_info)
+        if output_tab_key is None:
+            self._execute_command_main(server_name, command_info)
+        else:
+            self._execute_command_main(
+                server_name,
+                command_info,
+                output_tab_key=output_tab_key,
+            )
     
-    def _execute_command_main(self, server_name, command_info, completion_callback=None):
+    def _execute_command_main(
+        self,
+        server_name,
+        command_info,
+        completion_callback=None,
+        output_tab_key=None,
+    ):
         """执行指令的主体逻辑（连接检查、持续运行冲突检查等）"""
         command = command_info['command']
         self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 执行命令: {command}")
@@ -2916,11 +3141,19 @@ class ServerAssistant(QMainWindow):
                 previous_runnable = self.current_runnable
 
                 def continue_after_previous_finished():
-                    self._execute_command_continue(
-                        command_info,
-                        server_name,
-                        completion_callback,
-                    )
+                    if output_tab_key is None:
+                        self._execute_command_continue(
+                            command_info,
+                            server_name,
+                            completion_callback,
+                        )
+                    else:
+                        self._execute_command_continue(
+                            command_info,
+                            server_name,
+                            completion_callback,
+                            output_tab_key,
+                        )
 
                 previous_runnable.signals.finished.connect(
                     continue_after_previous_finished
@@ -2934,13 +3167,29 @@ class ServerAssistant(QMainWindow):
                 self.command_log.append(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 用户取消执行新指令")
                 return
         
-        self._execute_command_continue(
-            command_info,
-            server_name,
-            completion_callback,
-        )
+        if output_tab_key is None:
+            self._execute_command_continue(
+                command_info,
+                server_name,
+                completion_callback,
+            )
+        else:
+            self._execute_command_continue(
+                command_info,
+                server_name,
+                completion_callback,
+                output_tab_key,
+            )
     
-    def _execute_command_continue(self, command_info, server_name, completion_callback=None):
+    def _execute_command_continue(
+        self,
+        command_info,
+        server_name,
+        completion_callback=None,
+        output_tab_key=None,
+    ):
+        if output_tab_key is None:
+            output_tab_key = self.get_current_output_tab_key()
         client = self.server_manager.get_connection(server_name)
         if not client:
             QMessageBox.warning(self, '未连接', f'服务器 {server_name} 未连接')
@@ -2986,7 +3235,7 @@ class ServerAssistant(QMainWindow):
             else:
                 # 执行普通命令
                 self.command_log.append(f"  连接服务器: {server_name}")
-                self.prepare_output_shell_context(server_name)
+                self.prepare_output_shell_context(server_name, output_tab_key)
 
                 # 提交任务到线程池
                 is_continuous = command_info.get('continuous', False)
@@ -3001,21 +3250,27 @@ class ServerAssistant(QMainWindow):
                 
                 def on_command_result(result):
                     self.flush_partial_output()
-                    self.prepare_output_shell_context(server_name)
+                    self.prepare_output_shell_context(server_name, output_tab_key)
                     self.command_log.append(f"  收到命令执行结果")
-                    highlighted_text = self.highlight_keywords(result)
-                    self.append_output(highlighted_text)
+                    highlighted_text = self.highlight_keywords(result, output_tab_key)
+                    self.append_output(
+                        highlighted_text,
+                        output_tab_key=output_tab_key,
+                    )
                     self.command_log.append("  执行完成")
                 
                 def on_partial_result(partial):
-                    if object.__getattribute__(self, '__dict__').get('output_shell_server') != server_name:
+                    buffered_tab_key = object.__getattribute__(self, '__dict__').get(
+                        'partial_output_tab_key'
+                    )
+                    if self.partial_output_buffer and buffered_tab_key != output_tab_key:
                         self.flush_partial_output()
-                    self.prepare_output_shell_context(server_name)
-                    self.append_partial_output(partial)
+                    self.prepare_output_shell_context(server_name, output_tab_key)
+                    self.append_partial_output(partial, output_tab_key)
                 
                 def on_finished():
                     self.flush_partial_output()
-                    self.reset_terminal_output_formatter()
+                    self.reset_terminal_output_formatter(output_tab_key)
                     self.command_log.append("  命令执行完成")
                     self.remove_stop_button_for_runnable(runnable)
                     if completion_callback and runnable.stop_reason not in (
@@ -3413,19 +3668,19 @@ class ServerAssistant(QMainWindow):
     def show_command_context_menu(self, position):
         item = self.command_tree.itemAt(position)
         if item:
-            menu = QMenu()
             if item.parent():
-                # 指令的右键菜单
-                edit_action = QAction('编辑', self)
-                delete_action = QAction('删除', self)
-                
-                edit_action.triggered.connect(lambda: self.edit_command(item))
-                delete_action.triggered.connect(lambda: self.delete_command(item))
-                
-                menu.addAction(edit_action)
-                menu.addAction(delete_action)
+                category_item = item.parent()
+                category_index = self.command_tree.indexOfTopLevelItem(category_item)
+                command_index = category_item.indexOfChild(item)
+                self.show_command_actions_menu(
+                    self.command_tree.mapToGlobal(position),
+                    category_index,
+                    command_index,
+                )
+                return
             else:
                 # 分类的右键菜单
+                menu = QMenu(self)
                 edit_category_action = QAction('编辑分类', self)
                 add_command_action = QAction('添加指令', self)
                 delete_category_action = QAction('删除分类', self)
@@ -3437,17 +3692,61 @@ class ServerAssistant(QMainWindow):
                 menu.addAction(edit_category_action)
                 menu.addAction(add_command_action)
                 menu.addAction(delete_category_action)
-            
-            menu.exec_(self.command_tree.mapToGlobal(position))
+                menu.exec_(self.command_tree.mapToGlobal(position))
+
+    def show_command_button_context_menu(
+        self,
+        button,
+        position,
+        category_index,
+        command_index,
+    ):
+        """指令面板按钮使用与指令树相同的右键菜单。"""
+        self.show_command_actions_menu(
+            button.mapToGlobal(position),
+            category_index,
+            command_index,
+        )
+
+    def show_command_actions_menu(self, global_position, category_index, command_index):
+        if not 0 <= category_index < len(self.command_manager.commands):
+            return
+        commands = self.command_manager.commands[category_index].get('commands', [])
+        if not 0 <= command_index < len(commands):
+            return
+
+        menu = QMenu(self)
+        edit_action = QAction('编辑', self)
+        copy_action = QAction('复制', self)
+        delete_action = QAction('删除', self)
+
+        edit_action.triggered.connect(
+            lambda: self.edit_command_by_index(category_index, command_index)
+        )
+        copy_action.triggered.connect(
+            lambda: self.copy_command_by_index(category_index, command_index)
+        )
+        delete_action.triggered.connect(
+            lambda: self.delete_command_by_index(category_index, command_index)
+        )
+
+        menu.addAction(edit_action)
+        menu.addAction(copy_action)
+        menu.addSeparator()
+        menu.addAction(delete_action)
+        menu.exec_(global_position)
     
     def edit_command(self, item):
         category_item = item.parent()
         category_index = self.command_tree.indexOfTopLevelItem(category_item)
         command_index = category_item.indexOfChild(item)
+        self.edit_command_by_index(category_index, command_index)
+
+    def edit_command_by_index(self, category_index, command_index):
         command_info = self.command_manager.commands[category_index]['commands'][command_index]
         dialog = CommandDialog(command_info, command_manager=self.command_manager, server_manager=self.server_manager, parent=self)
         # 设置默认分类为原始指令的分类
-        category_name = category_item.text(0)
+        category_name = self.command_manager.commands[category_index]['name']
         dialog.category_combo.setCurrentText(category_name)
         if dialog.exec_():
             new_command_info = dialog.get_command_info()
@@ -3464,7 +3763,18 @@ class ServerAssistant(QMainWindow):
         category_item = item.parent()
         category_index = self.command_tree.indexOfTopLevelItem(category_item)
         command_index = category_item.indexOfChild(item)
+        self.delete_command_by_index(category_index, command_index)
+
+    def delete_command_by_index(self, category_index, command_index):
         self.command_manager.remove_command(category_index, command_index)
+        self.refresh_all_command_views()
+
+    def copy_command_by_index(self, category_index, command_index):
+        copied_command = self.command_manager.copy_command(category_index, command_index)
+        if copied_command is not None:
+            self.refresh_all_command_views()
+
+    def refresh_all_command_views(self):
         self.refresh_command_tree()
         # 刷新所有服务器页签的指令按钮
         for i in range(self.server_tabs.count()):
@@ -3620,6 +3930,10 @@ class ServerAssistant(QMainWindow):
             self.save_settings()
     
     def on_server_tab_changed(self, index):
+        # 先把旧页签尚未到定时刷新点的输出落盘，再保存其富文本和滚动位置。
+        if object.__getattribute__(self, '__dict__').get('partial_output_buffer'):
+            self.flush_partial_output()
+        self._save_active_output_state()
         running = getattr(self, 'current_runnable', None)
         if running is not None and getattr(running, 'is_running', False):
             self.stop_button.setEnabled(not getattr(running, 'stop_requested', False))
@@ -3631,45 +3945,55 @@ class ServerAssistant(QMainWindow):
             self.remove_stop_button()
         if index >= 0:
             server_name = self.server_tabs.tabText(index)
-            self.server_output.clear()
-            self.server_output.append(f'已切换到服务器: {server_name}')
+            state_exists = (
+                server_name in self.output_tab_states
+                and bool(self.output_tab_states[server_name].get('html'))
+            )
+            self.active_output_tab_key = server_name
+            if state_exists:
+                self._restore_output_tab_state(server_name)
+            else:
+                self.server_output.clear()
+                self.server_output.append(f'已切换到服务器: {server_name}')
             
             # 更新文件补全
             self.update_command_completer_with_files()
             
-            # 获取服务器信息
-            for server in self.server_manager.servers:
-                if server['name'] == server_name:
-                    self.server_output.append(f'服务器地址: {server["host"]}:{server["port"]}')
-                    self.server_output.append(f'登录用户: {server["username"]}')
-                    break
-            
-            # 获取当前目录
-            if server_name in self.current_dirs:
-                current_dir = self.current_dirs[server_name]
-                self.server_output.append(f'当前目录: {current_dir}')
-            else:
-                # 尝试获取当前目录
-                cached_dir = self.server_manager.get_shell_current_dir(server_name)
-                if isinstance(cached_dir, str) and cached_dir:
-                    self.current_dirs[server_name] = cached_dir
-                    self.server_output.append(f'当前目录: {cached_dir}')
+            if not state_exists:
+                # 首次打开页签时才显示连接元数据，后续切换只恢复历史。
+                for server in self.server_manager.servers:
+                    if server['name'] == server_name:
+                        self.server_output.append(f'服务器地址: {server["host"]}:{server["port"]}')
+                        self.server_output.append(f'登录用户: {server["username"]}')
+                        break
+
+                if server_name in self.current_dirs:
+                    current_dir = self.current_dirs[server_name]
+                    self.server_output.append(f'当前目录: {current_dir}')
                 else:
-                    client = self.server_manager.get_connection(server_name)
-                    if not client:
-                        self.current_dirs[server_name] = '/'
+                    cached_dir = self.server_manager.get_shell_current_dir(server_name)
+                    if isinstance(cached_dir, str) and cached_dir:
+                        self.current_dirs[server_name] = cached_dir
+                        self.server_output.append(f'当前目录: {cached_dir}')
                     else:
-                        try:
-                            stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
-                            current_dir = stdout.read().decode('utf-8', errors='replace').strip()
-                            self.current_dirs[server_name] = current_dir
-                            self.server_output.append(f'当前目录: {current_dir}')
-                        except Exception as e:
-                            self.server_output.append(f'获取当前目录失败: {e}')
-            self.output_shell_server = None
-            self.prepare_output_shell_context(server_name)
+                        client = self.server_manager.get_connection(server_name)
+                        if not client:
+                            self.current_dirs[server_name] = '/'
+                        else:
+                            try:
+                                stdin, stdout, stderr = client.exec_command('pwd', timeout=TIMEOUT_EXEC_SHORT)
+                                current_dir = stdout.read().decode('utf-8', errors='replace').strip()
+                                self.current_dirs[server_name] = current_dir
+                                self.server_output.append(f'当前目录: {current_dir}')
+                            except Exception as e:
+                                self.server_output.append(f'获取当前目录失败: {e}')
+                self._ensure_output_tab_state(server_name)['shell_server'] = None
+                self.output_shell_server = None
+                self.prepare_output_shell_context(server_name, server_name)
+                self._save_active_output_state()
         else:
             # 没有选中任何标签
+            self.active_output_tab_key = None
             self.server_output.clear()
             self.server_output.append('系统就绪，等待连接...')
             self.output_shell_server = None

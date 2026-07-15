@@ -4,12 +4,124 @@ import time
 import unittest
 from unittest.mock import patch, MagicMock
 
-from PyQt5.QtWidgets import QApplication, QTextEdit
-from PyQt5.QtCore import QMutex
+from PyQt5.QtWidgets import QApplication, QTextEdit, QPushButton
+from PyQt5.QtCore import QMutex, QPoint, Qt
 from PyQt5.QtGui import QFont, QFontMetrics
 app = QApplication.instance() or QApplication(sys.argv)
 
 import main
+
+
+class TestCommandManagerCopy(unittest.TestCase):
+    def setUp(self):
+        with patch.object(main.CommandManager, '__init__', lambda manager: None):
+            self.manager = main.CommandManager()
+        self.manager.commands = [
+            {
+                'name': '常用',
+                'commands': [
+                    {
+                        'name': '发布服务',
+                        'command': './deploy.sh',
+                        'params': [{'name': 'env', 'prompt': '环境'}],
+                        'linked_enabled': True,
+                        'linked_command': {'category': '常用', 'name': '检查服务'},
+                        'target_server': 'srvB',
+                    },
+                    {'name': '发布服务 - 副本', 'command': 'old copy'},
+                ],
+            }
+        ]
+        self.manager.save_commands = MagicMock()
+
+    def test_copy_command_deep_copies_full_config_and_uses_unique_name(self):
+        copied = self.manager.copy_command(0, 0)
+
+        self.assertEqual(copied['name'], '发布服务 - 副本 2')
+        self.assertEqual(copied['command'], './deploy.sh')
+        self.assertEqual(copied['target_server'], 'srvB')
+        self.assertEqual(copied['linked_command']['name'], '检查服务')
+        self.assertIsNot(copied, self.manager.commands[0]['commands'][0])
+        self.assertIsNot(
+            copied['params'],
+            self.manager.commands[0]['commands'][0]['params'],
+        )
+        self.assertIs(
+            self.manager.commands[0]['commands'][1],
+            copied,
+        )
+        self.manager.save_commands.assert_called_once()
+
+    def test_copying_an_existing_copy_continues_the_same_number_sequence(self):
+        copied = self.manager.copy_command(0, 1)
+
+        self.assertEqual(copied['name'], '发布服务 - 副本 2')
+
+
+class TestCommandButtonContextMenu(unittest.TestCase):
+    def test_command_button_right_click_opens_menu_for_its_command(self):
+        window = main.ServerAssistant()
+        try:
+            window.command_manager.commands = [
+                {
+                    'name': '常用',
+                    'commands': [
+                        {'name': '启动服务', 'command': './start.sh'},
+                        {'name': '停止服务', 'command': './stop.sh'},
+                    ],
+                }
+            ]
+            with patch.object(window, 'show_command_button_context_menu') as show_menu:
+                window.refresh_default_command_buttons()
+                button = next(
+                    candidate
+                    for candidate in window.default_command_layout.parentWidget().findChildren(QPushButton)
+                    if candidate.text() == '停止服务'
+                )
+                self.assertEqual(button.contextMenuPolicy(), Qt.CustomContextMenu)
+
+                position = QPoint(5, 5)
+                button.customContextMenuRequested.emit(position)
+
+            show_menu.assert_called_once_with(button, position, 0, 1)
+        finally:
+            window.close()
+
+
+class TestCommandDialogParamDeletion(unittest.TestCase):
+    def test_clicked_param_row_disappears_immediately_and_order_stays_stable(self):
+        command_manager = MagicMock()
+        command_manager.commands = []
+        dialog = main.CommandDialog(command_manager=command_manager)
+        try:
+            for name in ('参数A', '参数B', '参数C'):
+                dialog.add_param(name, '')
+            dialog.show()
+            app.processEvents()
+
+            deleted_widget = dialog.params[1][2]
+            delete_button = next(
+                button
+                for button in deleted_widget.findChildren(QPushButton)
+                if button.text() == '删除'
+            )
+            delete_button.click()
+
+            self.assertFalse(deleted_widget.isVisible())
+            self.assertIsNone(deleted_widget.parent())
+            self.assertEqual(
+                [param_edit.text() for param_edit, _, _ in dialog.params],
+                ['参数A', '参数C'],
+            )
+            self.assertEqual(
+                [
+                    dialog.params_layout.itemAt(index).widget()
+                    for index in range(dialog.params_layout.count())
+                ],
+                [entry[2] for entry in dialog.params],
+            )
+        finally:
+            dialog.close()
 
 
 class TestIsContinuousCommand(unittest.TestCase):
@@ -621,6 +733,50 @@ class TestOutputShellContext(unittest.TestCase):
 
         self.assertIn('\n[b@host /opt]$ ', after_target)
         self.assertTrue(after_restore.endswith('\n[a@host ~]$ '))
+
+
+class TestOutputTabHistory(unittest.TestCase):
+    def setUp(self):
+        self.window = main.ServerAssistant()
+        self.window.server_manager.servers = [
+            {'name': 'srvA', 'host': 'a.example', 'port': 22, 'username': 'a'},
+            {'name': 'srvB', 'host': 'b.example', 'port': 22, 'username': 'b'},
+        ]
+        self.window.add_server_tab('srvA')
+        self.window.append_output('A_HISTORY', is_html=False)
+        self.window.add_server_tab('srvB')
+        self.window.append_output('B_HISTORY', is_html=False)
+
+    def tearDown(self):
+        self.window.close()
+
+    def _switch_to(self, server_name):
+        for index in range(self.window.server_tabs.count()):
+            if self.window.server_tabs.tabText(index) == server_name:
+                self.window.server_tabs.setCurrentIndex(index)
+                app.processEvents()
+                return
+        self.fail(f'未找到页签 {server_name}')
+
+    def test_switching_back_restores_each_tabs_output_history(self):
+        self._switch_to('srvA')
+        self.assertIn('A_HISTORY', self.window.server_output.toPlainText())
+        self.assertNotIn('B_HISTORY', self.window.server_output.toPlainText())
+
+        self._switch_to('srvB')
+        self.assertIn('B_HISTORY', self.window.server_output.toPlainText())
+        self.assertNotIn('A_HISTORY', self.window.server_output.toPlainText())
+
+    def test_late_output_is_routed_to_originating_inactive_tab(self):
+        self.window.append_output(
+            'LATE_A',
+            is_html=False,
+            output_tab_key='srvA',
+        )
+        self.assertNotIn('LATE_A', self.window.server_output.toPlainText())
+
+        self._switch_to('srvA')
+        self.assertIn('LATE_A', self.window.server_output.toPlainText())
 
 
 if __name__ == '__main__':
