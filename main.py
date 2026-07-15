@@ -5,8 +5,8 @@ import sys
 import re
 import html
 import copy
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QGridLayout, QHBoxLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter, QInputDialog, QSpinBox
-from PyQt5.QtCore import Qt, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject, QStringListModel
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTabWidget, QVBoxLayout, QWidget, QSplitter, QPushButton, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem, QDialog, QFormLayout, QLineEdit, QLabel, QComboBox, QMenu, QAction, QTextEdit, QFileDialog, QMessageBox, QHBoxLayout, QLayout, QSizePolicy, QCheckBox, QScrollArea, QCompleter, QInputDialog, QSpinBox
+from PyQt5.QtCore import Qt, QRect, QSize, QMutex, QMutexLocker, QTimer, pyqtSignal, QEvent, QThreadPool, QRunnable, QObject, QStringListModel
 from PyQt5.QtGui import QFont, QFontMetrics, QColor, QTextCursor, QTextDocument, QIntValidator, QPixmap, QPainter
 import paramiko
 import json
@@ -351,6 +351,96 @@ def clear_layout(layout):
             if sub_layout is not None:
                 clear_layout(sub_layout)
                 sub_layout.deleteLater()
+
+
+class FlowLayout(QLayout):
+    """根据容器实时宽度自动换行和回流的按钮布局。"""
+
+    def __init__(self, parent=None, horizontal_spacing=5, vertical_spacing=5):
+        super().__init__(parent)
+        self._items = []
+        self._horizontal_spacing = horizontal_spacing
+        self._vertical_spacing = vertical_spacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientations(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(
+            margins.left() + margins.right(),
+            margins.top() + margins.bottom(),
+        )
+        return size
+
+    def _do_layout(self, rect, test_only):
+        margins = self.contentsMargins()
+        effective_rect = rect.adjusted(
+            margins.left(),
+            margins.top(),
+            -margins.right(),
+            -margins.bottom(),
+        )
+        x = effective_rect.x()
+        y = effective_rect.y()
+        line_height = 0
+
+        for item in self._items:
+            item_size = item.sizeHint()
+            next_x = x + item_size.width() + self._horizontal_spacing
+            if (
+                line_height > 0
+                and next_x - self._horizontal_spacing > effective_rect.right() + 1
+            ):
+                x = effective_rect.x()
+                y += line_height + self._vertical_spacing
+                next_x = x + item_size.width() + self._horizontal_spacing
+                line_height = 0
+
+            if not test_only:
+                item.setGeometry(QRect(x, y, item_size.width(), item_size.height()))
+            x = next_x
+            line_height = max(line_height, item_size.height())
+
+        return (
+            y
+            + line_height
+            - rect.y()
+            + margins.bottom()
+        )
 
 
 def create_status_icon(color_hex, size=10):
@@ -2973,13 +3063,11 @@ class ServerAssistant(QMainWindow):
             category_label.setFont(QFont('Arial', self.layout_params['category_font_size'], QFont.Bold))
             main_layout.addWidget(category_label)
             
-            # 创建网格布局，一行最多6个按钮
-            grid_layout = QGridLayout()
-            grid_layout.setContentsMargins(0, 0, 0, 0)
-            grid_layout.setSpacing(self.layout_params['button_spacing'])
-            grid_layout.setAlignment(Qt.AlignLeft)
-            row = 0
-            col = 0
+            # 根据面板实时宽度流式排列，窗口放大后会自动回流到上一行。
+            button_flow_layout = FlowLayout(
+                horizontal_spacing=self.layout_params['button_spacing'],
+                vertical_spacing=self.layout_params['button_spacing'],
+            )
             
             for command_index, command in enumerate(category['commands']):
                 button = QPushButton(command['name'])
@@ -2999,16 +3087,12 @@ class ServerAssistant(QMainWindow):
                     button.clicked.connect(lambda checked, cmd=command, srv=server_name: self.execute_command(srv, cmd))
                 else:
                     button.clicked.connect(lambda checked, cmd=command: self.execute_default_command(cmd))
-                grid_layout.addWidget(button, row, col)
-                
-                col += 1
-                if col >= 6:
-                    col = 0
-                    row += 1
+                button_flow_layout.addWidget(button)
             
-            # 创建一个容器widget来容纳网格布局
+            # 创建一个容器 widget 承载流式布局
             grid_widget = QWidget()
-            grid_widget.setLayout(grid_layout)
+            grid_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+            grid_widget.setLayout(button_flow_layout)
             main_layout.addWidget(grid_widget)
         
         # 将主容器添加到布局中

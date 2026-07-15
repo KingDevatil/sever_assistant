@@ -88,6 +88,41 @@ class TestCommandButtonContextMenu(unittest.TestCase):
             window.close()
 
 
+class TestResponsiveCommandButtonLayout(unittest.TestCase):
+    def test_buttons_wrap_when_narrow_and_flow_back_when_window_widens(self):
+        window = main.ServerAssistant()
+        try:
+            window.command_manager.commands = [
+                {
+                    'name': '常用',
+                    'commands': [
+                        {'name': f'响应式按钮{i}', 'command': f'echo {i}'}
+                        for i in range(8)
+                    ],
+                }
+            ]
+            window.refresh_default_command_buttons()
+            window.show()
+
+            window.resize(700, 800)
+            app.processEvents()
+            buttons = [
+                button
+                for button in window.default_command_panel.findChildren(QPushButton)
+                if button.text().startswith('响应式按钮')
+            ]
+            narrow_rows = len({button.y() for button in buttons})
+
+            window.resize(1800, 800)
+            app.processEvents()
+            wide_rows = len({button.y() for button in buttons})
+
+            self.assertGreater(narrow_rows, 1)
+            self.assertEqual(wide_rows, 1)
+        finally:
+            window.close()
+
+
 class TestCommandDialogParamDeletion(unittest.TestCase):
     def test_clicked_param_row_disappears_immediately_and_order_stays_stable(self):
         command_manager = MagicMock()
